@@ -1478,13 +1478,12 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
 
       // Navigation tabs
       var tabs = [
-        ["status", "1. 基本设置与分流模式"],
-        ["servers", "2. 节点管理与订阅 (" + self.servers.length + ")"],
-        ["dns", "3. DNS 与 FakeDNS"],
-        ["routing", "4. 出站规则与流量嗅探"],
-        ["lan", "5. 局域网设备与入站"],
-        ["advanced", "6. 高级参数与监控"],
-        ["preview", "7. 配置预览与日志"]
+        ["status", "1. 基本设置与节点订阅 (" + self.servers.length + ")"],
+        ["dns", "2. DNS 与 FakeDNS"],
+        ["routing", "3. 出站规则与流量嗅探"],
+        ["lan", "4. 局域网设备与入站"],
+        ["advanced", "5. 高级参数与监控"],
+        ["preview", "6. 配置预览与日志"]
       ];
       var tabBar = h("div", { class: "xgl-tabs" }, tabs.map(function (t) {
         return h("div", {
@@ -1498,10 +1497,17 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         }, t[1]);
       }));
 
-      // Tab 1: General Settings
+      // Filter servers for node list
+      var kw = self.serverKeyword.trim().toLowerCase();
+      var filteredServers = self.servers.filter(function (s) {
+        if (!kw) return true;
+        return ((s.alias || "") + " " + (s.server || "") + " " + (s.protocol || "")).toLowerCase().indexOf(kw) >= 0;
+      });
+
+      // Tab 1: General Settings + Routing Mode + Servers & Subscriptions (Merged)
       var tabStatus = h("div", [
         h("div", { class: "xgl-section-title" }, [
-          h("span", "核心透明代理开关与主用节点"),
+          h("span", "核心透明代理开关、主用节点与分流模式"),
           h("div", { class: "xgl-status-group" }, [
             h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("bypass_cn"); } } }, "一键预设：绕过中国大陆"),
             h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("global"); } } }, "一键预设：全局代理")
@@ -1532,19 +1538,11 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           ["random", "random (随机分配)"],
           ["leastPing", "leastPing (最低延迟优先)"],
           ["roundRobin", "roundRobin (按序轮询)"]
-        ]))
-      ]);
+        ])),
 
-      // Tab 2: Servers & Subscriptions
-      var kw = self.serverKeyword.trim().toLowerCase();
-      var filteredServers = self.servers.filter(function (s) {
-        if (!kw) return true;
-        return ((s.alias || "") + " " + (s.server || "") + " " + (s.protocol || "")).toLowerCase().indexOf(kw) >= 0;
-      });
-
-      var tabServers = h("div", [
-        h("div", { class: "xgl-section-title" }, [
-          h("span", "服务器节点列表 (" + filteredServers.length + " / " + self.servers.length + ")"),
+        // Node management & Subscription section placed right below routing/general settings
+        h("div", { class: "xgl-section-title", style: { marginTop: "28px" } }, [
+          h("span", "服务器节点管理与订阅 (" + filteredServers.length + " / " + self.servers.length + ")"),
           h("div", { class: "xgl-status-group" }, [
             h("input", {
               class: "xgl-input",
@@ -1993,8 +1991,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
       ]) : null;
 
       var activeView = tabStatus;
-      if (self.activeTab === "servers") activeView = tabServers;
-      else if (self.activeTab === "dns") activeView = tabDns;
+      if (self.activeTab === "dns") activeView = tabDns;
       else if (self.activeTab === "routing") activeView = tabRouting;
       else if (self.activeTab === "lan") activeView = tabLan;
       else if (self.activeTab === "advanced") activeView = tabAdvanced;
@@ -2006,7 +2003,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           topBar,
           tabBar,
           activeView,
-          self.activeTab !== "servers" && self.activeTab !== "preview" ? h("div", { class: "xgl-btn-bar" }, [
+          self.activeTab !== "preview" ? h("div", { class: "xgl-btn-bar" }, [
             h("button", { class: "xgl-btn", on: { click: self.loadAll } }, "重新加载配置"),
             h("button", {
               class: "xgl-btn primary",
