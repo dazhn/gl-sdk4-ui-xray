@@ -25,7 +25,7 @@
       ".xgl-input, .xgl-select, .xgl-textarea { width: 100%; box-sizing: border-box; padding: 7px 11px; border-radius: 6px; border: 1px solid rgba(140,140,140,0.35); background: transparent; color: inherit; font-size: 13px; outline: none; }",
       ".xgl-input:focus, .xgl-select:focus, .xgl-textarea:focus { border-color: #2b6cb0; }",
       ".xgl-select option { background: #222; color: #fff; }",
-      ".xgl-textarea { font-family: Consolas, Monaco, monospace; resize: vertical; min-height: 76px; }",
+      ".xgl-textarea { font-family: inherit; resize: vertical; min-height: 34px; line-height: 1.45; overflow-y: auto; }",
       ".xgl-btn-bar { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-top: 18px; padding-top: 12px; border-top: 1px solid rgba(140,140,140,0.18); }",
       ".xgl-btn { padding: 7px 15px; border-radius: 6px; border: 1px solid rgba(140,140,140,0.35); background: transparent; color: inherit; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.15s; }",
       ".xgl-btn:hover { background: rgba(128,128,128,0.12); }",
@@ -648,6 +648,18 @@
         });
       }
 
+      function autoTextarea(obj, key, placeholder) {
+        var val = obj[key] || "";
+        var lineCount = val ? String(val).split(/\r?\n/).length : 1;
+        var rows = lineCount <= 1 ? 1 : (lineCount > 6 ? 6 : lineCount);
+        return h("textarea", {
+          class: "xgl-textarea",
+          attrs: { rows: rows, placeholder: placeholder || "" },
+          domProps: { value: val },
+          on: { input: function (e) { self.$set(obj, key, e.target.value); } }
+        });
+      }
+
       function flagSwitch(obj, key) {
         return h("gl-switch", {
           props: { value: obj[key] === "1" },
@@ -886,23 +898,11 @@
           h("button", { class: "xgl-btn sm", on: { click: self.triggerGeoUpdate } }, "🌐 在线更新 GeoIP / GeoSite 规则库")
         ]),
         row("国内快速 DNS (Fast DNS)", "用于解析代理服务器入口域名及下方直连白名单域名（推荐 223.5.5.5:53 或 119.29.29.29:53）", textInput(self.gen, "fast_dns", "223.5.5.5:53")),
-        row("直连域名规则 (Bypassed Domain Rules)", "每行一条，匹配域名使用快速 DNS 解析且直接绕过代理直连（如 geosite:cn 或 domain:bilibili.com）", h("textarea", {
-          class: "xgl-textarea",
-          domProps: { value: self.bypassedRulesText },
-          on: { input: function (e) { self.bypassedRulesText = e.target.value; } }
-        })),
+        row("直连域名规则 (Bypassed Domain Rules)", "每行一条，匹配域名使用快速 DNS 解析且直接绕过代理直连（如 geosite:cn 或 domain:bilibili.com）", autoTextarea(self, "bypassedRulesText", "例如 geosite:cn（回车可输入多行）")),
         row("海外安全 DNS (Secure DNS)", "通过代理解析被污染的海外域名（推荐 1.1.1.1:53 或 8.8.8.8:53）", textInput(self.gen, "secure_dns", "1.1.1.1:53")),
-        row("强制代理域名规则 (Forwarded Domain Rules)", "每行一条，匹配域名走安全 DNS 并强制走代理出站（如 geosite:geolocation-!cn 或 domain:openai.com）", h("textarea", {
-          class: "xgl-textarea",
-          domProps: { value: self.forwardedRulesText },
-          on: { input: function (e) { self.forwardedRulesText = e.target.value; } }
-        })),
+        row("强制代理域名规则 (Forwarded Domain Rules)", "每行一条，匹配域名走安全 DNS 并强制走代理出站（如 geosite:geolocation-!cn 或 domain:openai.com）", autoTextarea(self, "forwardedRulesText", "例如 geosite:geolocation-!cn（回车可输入多行）")),
         row("默认兜底 DNS (Default DNS)", "未命中上述规则的其他域名使用的 DNS", textInput(self.gen, "default_dns", "1.1.1.1:53")),
-        row("广告与拦截域名规则 (Blocked Domain Rules)", "每行一条，匹配域名直接拦截（如 geosite:category-ads）", h("textarea", {
-          class: "xgl-textarea",
-          domProps: { value: self.blockedRulesText },
-          on: { input: function (e) { self.blockedRulesText = e.target.value; } }
-        })),
+        row("广告与拦截域名规则 (Blocked Domain Rules)", "每行一条，匹配域名直接拦截（如 geosite:category-ads）", autoTextarea(self, "blockedRulesText", "例如 geosite:category-ads（回车可输入多行）")),
         row("拦截域名返回 127.127.127.127 (Blocked to Loopback)", "关闭则返回 NXDOMAIN", flagSwitch(self.gen, "blocked_to_loopback")),
         row("Xray 内部 DNS 监听端口 (DNS Server Port)", "供 dnsmasq 转发上游使用，勿填 53 或 5353", textInput(self.gen, "dns_port", "5300")),
         row("额外并发 DNS 端口数 (Extra DNS Ports)", "默认 3 表示同时监听 5300~5303 共 4 个端口提升并发能力", textInput(self.gen, "dns_count", "3")),
@@ -914,26 +914,10 @@
 
         // Merged Outbound Routing, Sniffing, LAN Hosts & Extra Inbounds
         h("div", { class: "xgl-section-title", style: { marginTop: "24px" } }, "GeoIP 国家代码与 IP/端口出站分流规则"),
-        row("GeoIP 直连代码列表 (IPv4)", "每行一个代码，如 cn（中国大陆 IP 直连）或 telegram；留空则全部非私网 IP 走代理", h("textarea", {
-          class: "xgl-textarea",
-          domProps: { value: self.geoipDirectV4Text },
-          on: { input: function (e) { self.geoipDirectV4Text = e.target.value; } }
-        })),
-        row("GeoIP 直连代码列表 (IPv6)", "每行一个代码，如 cn", h("textarea", {
-          class: "xgl-textarea",
-          domProps: { value: self.geoipDirectV6Text },
-          on: { input: function (e) { self.geoipDirectV6Text = e.target.value; } }
-        })),
-        row("绕过代理的目标 IP / CIDR (Bypassed IP)", "每行一个 IP 或网段，访问这些目标 IP 时强制直连不经过 Xray", h("textarea", {
-          class: "xgl-textarea",
-          domProps: { value: self.wanBpIpsText },
-          on: { input: function (e) { self.wanBpIpsText = e.target.value; } }
-        })),
-        row("强制代理的目标 IP / CIDR (Forwarded IP)", "每行一个 IP 或网段，访问这些目标 IP 时始终交由 Xray 处理", h("textarea", {
-          class: "xgl-textarea",
-          domProps: { value: self.wanFwIpsText },
-          on: { input: function (e) { self.wanFwIpsText = e.target.value; } }
-        })),
+        row("GeoIP 直连代码列表 (IPv4)", "每行一个代码，如 cn（中国大陆 IP 直连）或 telegram；留空则全部非私网 IP 走代理", autoTextarea(self, "geoipDirectV4Text", "如 cn")),
+        row("GeoIP 直连代码列表 (IPv6)", "每行一个代码，如 cn", autoTextarea(self, "geoipDirectV6Text", "如 cn")),
+        row("绕过代理的目标 IP / CIDR (Bypassed IP)", "每行一个 IP 或网段，访问这些目标 IP 时强制直连不经过 Xray", autoTextarea(self, "wanBpIpsText", "每行一个 IP 或 CIDR")),
+        row("强制代理的目标 IP / CIDR (Forwarded IP)", "每行一个 IP 或网段，访问这些目标 IP 时始终交由 Xray 处理", autoTextarea(self, "wanFwIpsText", "每行一个 IP 或 CIDR")),
         row("默认端口转发策略 (Default Ports Policy)", "Forwarded 转发所有端口；Bypassed 仅代理指定的常用端口（如 80, 443）", selectInput(self.gen, "transparent_default_port_policy", [
           ["forwarded", "forwarded (默认转发所有端口)"],
           ["bypassed", "bypassed (默认绕过，仅转发指定端口)"]
@@ -1094,12 +1078,7 @@
         ])),
         row("每连接内部缓存大小 (Buffer Size KB)", "默认 512", textInput(self.gen, "buffer_size", "512")),
         row("启用 IPv4 TCP 动态直连优化 (Dynamic Direct)", "大连接数下载场景可提升直连性能", flagSwitch(self.gen, "dynamic_direct_tcp4")),
-        row("自定义 ucode 配置钩子 (Custom Configuration Hook)", "高级用户在生成 config.json 前动态修改配置对象的 ucode 函数", h("textarea", {
-          class: "xgl-textarea",
-          attrs: { placeholder: "return function(config) {\n    return config;\n};" },
-          domProps: { value: self.gen.custom_configuration_hook },
-          on: { input: function (e) { self.gen.custom_configuration_hook = e.target.value; } }
-        }))
+        row("自定义 ucode 配置钩子 (Custom Configuration Hook)", "高级用户在生成 config.json 前动态修改配置对象的 ucode 函数", autoTextarea(self.gen, "custom_configuration_hook", "return function(config) { return config; };"))
       ]);
 
       // Tab 7: Config Preview & Logs
