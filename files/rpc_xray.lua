@@ -31,7 +31,50 @@ local function file_size_mb(path)
     if not f then return false, "0 MB" end
     local sz = f:seek("end") or 0
     f:close()
-    return true, string.format("%.2f MB", sz / (1024 * 1024))
+    return sz > 0, string.format("%.2f MB", sz / (1024 * 1024))
+end
+
+-- Non-blocking subprocess stdout reader via OpenResty ngx.pipe.spawn
+local function spawn_read(cmd, timeout_ms)
+    if ngx and ngx.pipe and ngx.pipe.spawn then
+        local ok, proc = pcall(ngx.pipe.spawn, cmd, {
+            stdout_read_timeout = timeout_ms or 10000
+        })
+        if ok and proc then
+            local out, _, partial = proc:stdout_read_all()
+            pcall(function() proc:wait() end)
+            return out or partial or ""
+        end
+    end
+    local cmd_str
+    if type(cmd) == "table" then
+        local parts = {}
+        for _, arg in ipairs(cmd) do
+            parts[#parts + 1] = "'" .. tostring(arg):gsub("'", "'\\''") .. "'"
+        end
+        cmd_str = table.concat(parts, " ")
+    else
+        cmd_str = tostring(cmd)
+    end
+    local f = io.popen(cmd_str)
+    local out = f and f:read("*a") or ""
+    if f then f:close() end
+    return out
+end
+
+-- Synchronous (non-blocking coroutine wait) service control via ngx.pipe.spawn
+local function service_exec(action)
+    if ngx and ngx.pipe and ngx.pipe.spawn then
+        local ok, proc = pcall(ngx.pipe.spawn, { "/etc/init.d/xray_core", action }, {
+            stdout_read_timeout = 30000
+        })
+        if ok and proc then
+            pcall(function() proc:wait() end)
+            return true
+        end
+    end
+    os.execute("/etc/init.d/xray_core " .. action .. " >/dev/null 2>&1")
+    return true
 end
 
 local function url_decode(s)
@@ -112,14 +155,32 @@ local function get_lan_clients()
     return clients
 end
 
-local function is_xray_running()
-    local svc = ubus.call("service", "list", { name = "xray_core" })
-    if svc and svc.xray_core and svc.xray_core.instances then
+-- Check both xray process status and /var/etc/xray/01_firewall_include.nft TProxy rule file
+local function get_xray_status(gen)
+    local proc_alive = false
+    local ok_u, svc = pcall(ubus.call, "service", "list", { name = "xray_core" })
+    if ok_u and svc and svc.xray_core and svc.xray_core.instances then
         for _, inst in pairs(svc.xray_core.instances) do
-            if inst.running then return true end
+            if inst.running then
+                proc_alive = true
+                break
+            end
         end
     end
-    return fs.access("/var/run/xray.pid") or false
+    if not proc_alive then
+        local pid = trim(spawn_read({ "pidof", "xray" }, 2000))
+        proc_alive = (pid ~= "")
+    end
+
+    local tproxy_active = fs.access("/var/etc/xray/01_firewall_include.nft") and true or false
+    local want_tproxy = (not gen) or (gen.transparent_proxy_enable == "1")
+    local running = proc_alive and (not want_tproxy or tproxy_active)
+    return running, proc_alive, tproxy_active
+end
+
+local function is_xray_running(gen)
+    local running = get_xray_status(gen)
+    return running
 end
 
 local function apply_uci_fields(c, pkg, sec, values)
@@ -147,12 +208,74 @@ local function apply_uci_fields(c, pkg, sec, values)
     end
 end
 
+-- Clean up references to deleted server IDs across general balancers, servers.dialer_proxy, and extra_inbound.destination
+local function cleanup_deleted_server_refs(c, deleted_map)
+    local changed = false
+    local gen_id, gen = get_general_section(c)
+    if gen_id and gen then
+        for _, pool_key in ipairs({ "tcp_balancer_v4", "udp_balancer_v4", "tcp_balancer_v6", "udp_balancer_v6" }) do
+            local pool = gen[pool_key]
+            if type(pool) == "string" then pool = { pool } end
+            if type(pool) == "table" then
+                local filtered = {}
+                for _, item in ipairs(pool) do
+                    if deleted_map[item] then
+                        changed = true
+                    else
+                        filtered[#filtered + 1] = item
+                    end
+                end
+                if #filtered ~= #pool then
+                    if #filtered > 0 then
+                        c:set("xray_core", gen_id, pool_key, filtered)
+                    else
+                        c:delete("xray_core", gen_id, pool_key)
+                    end
+                end
+            end
+        end
+    end
+
+    c:foreach("xray_core", "servers", function(s)
+        local s_id = s[".name"]
+        if not deleted_map[s_id] and s.dialer_proxy and deleted_map[s.dialer_proxy] then
+            c:set("xray_core", s_id, "dialer_proxy", "disabled")
+            changed = true
+        end
+    end)
+
+    c:foreach("xray_core", "extra_inbound", function(ib)
+        local ib_id = ib[".name"]
+        local dest = ib.destination
+        if type(dest) == "string" then dest = { dest } end
+        if type(dest) == "table" then
+            local filtered = {}
+            for _, item in ipairs(dest) do
+                if deleted_map[item] then
+                    changed = true
+                else
+                    filtered[#filtered + 1] = item
+                end
+            end
+            if #filtered ~= #dest then
+                if #filtered > 0 then
+                    c:set("xray_core", ib_id, "destination", filtered)
+                else
+                    c:delete("xray_core", ib_id, "destination")
+                    c:set("xray_core", ib_id, "specify_outbound", "0")
+                end
+            end
+        end
+    end)
+
+    return changed
+end
+
 local function fetch_metrics_summary(port)
     port = tonumber(port) or 18888
-    local f = io.popen(string.format("curl -s --connect-timeout 1 -m 2 http://127.0.0.1:%d/debug/vars 2>/dev/null", port))
-    local raw = f and f:read("*a") or ""
-    if f then f:close() end
-    if raw == "" then return nil end
+    local url = string.format("http://127.0.0.1:%d/debug/vars", port)
+    local raw = spawn_read({ "curl", "-s", "--connect-timeout", "1", "-m", "2", url }, 3000)
+    if not raw or raw == "" then return nil end
 
     local ok, j = pcall(cjson.decode, raw)
     if not ok or type(j) ~= "table" then return nil end
@@ -251,13 +374,15 @@ function M.get_all()
 
     local geoip_ok, geoip_sz = file_size_mb("/usr/share/xray/geoip.dat")
     local geosite_ok, geosite_sz = file_size_mb("/usr/share/xray/geosite.dat")
-    local running = is_xray_running()
-    local metrics = running and fetch_metrics_summary(gen.metrics_server_port) or nil
+    local running, proc_alive, tproxy_active = get_xray_status(gen)
+    local metrics = proc_alive and fetch_metrics_summary(gen.metrics_server_port) or nil
 
     return {
         code = 0,
         data = {
             running = running,
+            proc_running = proc_alive,
+            tproxy_enabled = tproxy_active,
             geoip_ok = geoip_ok,
             geoip_size = geoip_sz,
             geosite_ok = geosite_ok,
@@ -275,12 +400,14 @@ end
 function M.get_metrics()
     local c = uci.cursor()
     local _, gen = get_general_section(c)
-    local running = is_xray_running()
+    local running, proc_alive, tproxy_active = get_xray_status(gen)
     return {
         code = 0,
         data = {
             running = running,
-            metrics = running and fetch_metrics_summary(gen and gen.metrics_server_port) or nil
+            proc_running = proc_alive,
+            tproxy_enabled = tproxy_active,
+            metrics = proc_alive and fetch_metrics_summary(gen and gen.metrics_server_port) or nil
         }
     }
 end
@@ -296,7 +423,7 @@ function M.save_general(args)
     c:commit("xray_core")
 
     if args.apply ~= false then
-        os.execute("/etc/init.d/xray_core restart >/dev/null 2>&1 &")
+        service_exec("restart")
     end
     return { code = 0, data = { ok = true } }
 end
@@ -323,7 +450,6 @@ function M.switch_node(args)
         c:set("xray_core", gen_id, "udp_balancer_v4", args.udp_nodes)
     end
 
-    -- Non-destructively toggle geosite:cn / geoip:cn for routing preset
     if args.preset == "bypass_cn" then
         local bp = type(gen.bypassed_domain_rules) == "table" and gen.bypassed_domain_rules or {}
         local found = false
@@ -349,7 +475,7 @@ function M.switch_node(args)
     end
 
     c:commit("xray_core")
-    os.execute("/etc/init.d/xray_core restart >/dev/null 2>&1 &")
+    service_exec("restart")
     return { code = 0, data = { ok = true } }
 end
 
@@ -382,42 +508,35 @@ function M.save_server(args)
     apply_uci_fields(c, "xray_core", sec, args.values)
     c:commit("xray_core")
     if args.apply then
-        os.execute("/etc/init.d/xray_core restart >/dev/null 2>&1 &")
+        service_exec("restart")
     end
     return { code = 0, data = { id = sec } }
 end
 
--- 5. Delete a server node (and clean up any dangling reference in balancer pools)
+-- 5. Delete a server node (clean up balancers, dialer_proxy, extra_inbound.destination & restart if active)
 function M.delete_server(args)
-    if type(args) ~= "table" or type(args.id) ~= "string" then
+    if type(args) ~= "table" or type(args.id) ~= "string" or args.id == "" then
         return { code = -1, error = "未指定节点 ID" }
     end
     local c = uci.cursor()
-    c:delete("xray_core", args.id)
-
-    local gen_id, gen = get_general_section(c)
-    if gen_id and gen then
-        for _, pool_key in ipairs({ "tcp_balancer_v4", "udp_balancer_v4", "tcp_balancer_v6", "udp_balancer_v6" }) do
-            local pool = gen[pool_key]
-            if type(pool) == "table" then
-                local filtered = {}
-                for _, item in ipairs(pool) do
-                    if item ~= args.id then filtered[#filtered + 1] = item end
-                end
-                if #filtered > 0 then
-                    c:set("xray_core", gen_id, pool_key, filtered)
-                else
-                    c:delete("xray_core", gen_id, pool_key)
-                end
-            end
-        end
+    if c:get("xray_core", args.id) ~= "servers" then
+        return { code = -1, error = "目标不是有效的服务器节点" }
     end
 
+    local _, gen = get_general_section(c)
+    local _, proc_alive = get_xray_status(gen)
+
+    c:delete("xray_core", args.id)
+    local ref_changed = cleanup_deleted_server_refs(c, { [args.id] = true })
     c:commit("xray_core")
-    return { code = 0, data = { ok = true } }
+
+    if (ref_changed or args.apply) and proc_alive then
+        service_exec("restart")
+    end
+    return { code = 0, data = { ok = true, restarted = (ref_changed and proc_alive) or false } }
 end
 
--- 6. Parse URI share links (ss://, vmess://, vless://, trojan://) and subscription URLs
+-- 6. Parse URI share links (ss://, vmess://, vless://, trojan://, hysteria2://, hy2://) and subscription URLs
 local function parse_query(qs)
     local q = {}
     if not qs then return q end
@@ -428,21 +547,73 @@ local function parse_query(qs)
     return q
 end
 
+-- Parse host:port with support for IPv6 literal ([...]:port), trailing slash (:443/...), and Hysteria2 port hopping (:443,20000-50000)
+local function parse_host_port(hp)
+    if not hp or hp == "" then return nil, nil, nil end
+    local url_path = hp:match("^[^/]+(/.*)$")
+    hp = hp:gsub("/.*$", "")
+
+    local host, port_spec
+    if hp:sub(1, 1) == "[" then
+        host, port_spec = hp:match("^%[([^%]]+)%]:(.+)$")
+        if not host then
+            host = hp:match("^%[([^%]]+)%]$")
+        end
+    else
+        host, port_spec = hp:match("^([^:]+):(.+)$")
+        if not host then
+            host = hp
+        end
+    end
+    if not host or host == "" then return nil, nil, nil end
+
+    local port, hop_port
+    if port_spec and port_spec ~= "" then
+        local p1, rest = port_spec:match("^(%d+),(.+)$")
+        if p1 then
+            port = p1
+            hop_port = rest
+        else
+            local single_p = port_spec:match("^(%d+)$")
+            if single_p then
+                port = single_p
+            else
+                local range_start = port_spec:match("^(%d+)%-%d+$")
+                if range_start then
+                    port = range_start
+                    hop_port = port_spec
+                end
+            end
+        end
+    end
+
+    return host, port, hop_port, url_path
+end
+
 local function parse_single_uri(line)
     line = trim(line)
     if line == "" then return nil end
 
-    -- 1. vmess:// (base64 JSON)
+    -- 1. vmess:// (base64 JSON, with optional #remark suffix)
     if line:match("^vmess://") then
-        local b64 = line:sub(9)
-        local raw = base64_decode(b64)
+        local rest = line:sub(9)
+        local hash_alias = nil
+        local hash_pos = rest:find("#", 1, true)
+        if hash_pos then
+            hash_alias = url_decode(rest:sub(hash_pos + 1))
+            rest = rest:sub(1, hash_pos - 1)
+        end
+        local raw = base64_decode(rest)
         local ok, j = pcall(cjson.decode, raw)
         if ok and type(j) == "table" and j.add and j.port then
             local net = j.net or "tcp"
             if net == "xhttp" then net = "splithttp" end
             local tls_mode = (j.tls == "tls" or j.tls == "1") and "tls" or "none"
+            local alias_val = (j.ps and tostring(j.ps) ~= "" and tostring(j.ps))
+                or (hash_alias and hash_alias ~= "" and hash_alias)
+                or (tostring(j.add) .. ":" .. tostring(j.port))
             local srv = {
-                alias = tostring(j.ps or (j.add .. ":" .. tostring(j.port))),
+                alias = alias_val,
                 server = tostring(j.add),
                 server_port = { tostring(j.port) },
                 password = tostring(j.id or ""),
@@ -473,7 +644,7 @@ local function parse_single_uri(line)
             end
             if tls_mode == "tls" then
                 srv.vmess_tls_host = tostring(j.sni or j.host or "")
-                srv.vmess_tls_insecure = (j.allowInsecure == true or j.allowInsecure == "1") and "1" or "0"
+                srv.vmess_tls_insecure = (j.allowInsecure == true or j.allowInsecure == "1" or j.insecure == "1") and "1" or "0"
                 srv.vmess_tls_fingerprint = tostring(j.fp or "chrome")
             end
             return srv
@@ -481,7 +652,7 @@ local function parse_single_uri(line)
         return nil
     end
 
-    -- 2. ss:// (SIP002 & legacy base64)
+    -- 2. ss:// (SIP002 & legacy base64, IPv4 & IPv6 literal)
     if line:match("^ss://") then
         local rest = line:sub(6)
         local alias = ""
@@ -502,10 +673,14 @@ local function parse_single_uri(line)
                 userinfo = url_decode(userinfo)
             end
             method, pass = userinfo:match("^([^:]+):(.+)$")
-            host, port = hostport:match("^([^:]+):(%d+)$")
+            host, port = parse_host_port(hostport)
         else
             local decoded = base64_decode(rest)
-            method, pass, host, port = decoded:match("^([^:]+):(.+)@([^:]+):(%d+)$")
+            local d_user, d_hp = decoded:match("^(.+)@([^@]+)$")
+            if d_user and d_hp then
+                method, pass = d_user:match("^([^:]+):(.+)$")
+                host, port = parse_host_port(d_hp)
+            end
         end
 
         if method and pass and host and port then
@@ -527,7 +702,61 @@ local function parse_single_uri(line)
         return nil
     end
 
-    -- 3. vless:// and trojan://
+    -- 3. hysteria2:// and hy2://
+    local hy_prefix = line:match("^(hysteria2)://") or line:match("^(hy2)://")
+    if hy_prefix then
+        local rest = line:sub(#hy_prefix + 4)
+        local alias = ""
+        local hash_pos = rest:find("#", 1, true)
+        if hash_pos then
+            alias = url_decode(rest:sub(hash_pos + 1))
+            rest = rest:sub(1, hash_pos - 1)
+        end
+        local qs = ""
+        local q_pos = rest:find("?", 1, true)
+        if q_pos then
+            qs = rest:sub(q_pos + 1)
+            rest = rest:sub(1, q_pos - 1)
+        end
+        local auth, hostport = rest:match("^([^@]+)@(.+)$")
+        if not auth then
+            auth = ""
+            hostport = rest
+        else
+            auth = url_decode(auth)
+        end
+        local host, port, hop_port = parse_host_port(hostport)
+        if not host then return nil end
+        port = port or "443"
+
+        local q = parse_query(qs)
+        local up_val = (q.upmbps or q.up or ""):match("^(%d+)") or ""
+        local down_val = (q.downmbps or q.down or ""):match("^(%d+)") or ""
+        local mport = q.mport or hop_port or ""
+        local insecure = (q.insecure == "1" or q.insecure == "true" or q.allowInsecure == "1") and "1" or "0"
+
+        return {
+            alias = (alias ~= "" and alias) or (host .. ":" .. port),
+            server = host,
+            server_port = { port },
+            password = auth,
+            protocol = "hysteria",
+            transport = "hysteria",
+            hysteria_tls = "tls",
+            hysteria_tls_host = q.sni or q.peer or "",
+            hysteria_tls_insecure = insecure,
+            hysteria_tls_fingerprint = q.fp or "chrome",
+            hysteria_up = up_val,
+            hysteria_up_mbps = up_val,
+            hysteria_down = down_val,
+            hysteria_down_mbps = down_val,
+            hysteria_udphop_port = mport,
+            domain_strategy = "UseIP",
+            dialer_proxy = "disabled"
+        }
+    end
+
+    -- 4. vless:// and trojan://
     local proto = line:match("^(vless)://") or line:match("^(trojan)://")
     if proto then
         local rest = line:sub(#proto + 4)
@@ -543,13 +772,16 @@ local function parse_single_uri(line)
             qs = rest:sub(q_pos + 1)
             rest = rest:sub(1, q_pos - 1)
         end
-        local uuid, host, port = rest:match("^([^@]+)@([^:]+):(%d+)$")
-        if not uuid then return nil end
+        local uuid, hostport = rest:match("^([^@]+)@(.+)$")
+        if not uuid or not hostport then return nil end
+        local host, port, _, url_path = parse_host_port(hostport)
+        if not host or not port then return nil end
         uuid = url_decode(uuid)
         local q = parse_query(qs)
         local net = q.type or "tcp"
         if net == "xhttp" then net = "splithttp" end
         local sec = q.security or (proto == "trojan" and "tls" or "none")
+        local path_val = q.path or (url_path and url_path ~= "/" and url_decode(url_path)) or "/"
 
         local srv = {
             alias = (alias ~= "" and alias) or (host .. ":" .. port),
@@ -569,12 +801,13 @@ local function parse_single_uri(line)
                 srv.vless_flow_tls = q.flow or "none"
                 srv.vless_tls_host = q.sni or q.host or ""
                 srv.vless_tls_fingerprint = q.fp or "chrome"
-                srv.vless_tls_insecure = (q.allowInsecure == "1") and "1" or "0"
+                srv.vless_tls_insecure = (q.allowInsecure == "1" or q.insecure == "1") and "1" or "0"
             elseif sec == "reality" then
                 srv.vless_flow_reality = q.flow or "xtls-rprx-vision"
                 srv.vless_reality_server_name = q.sni or ""
                 srv.vless_reality_public_key = q.pbk or ""
                 srv.vless_reality_short_id = q.sid or ""
+                srv.vless_reality_spider_x = q.spx or ""
                 srv.vless_spider_x = q.spx or ""
                 srv.vless_reality_fingerprint = q.fp or "chrome"
             end
@@ -583,7 +816,7 @@ local function parse_single_uri(line)
             if srv.trojan_tls == "tls" then
                 srv.trojan_tls_host = q.sni or q.host or ""
                 srv.trojan_tls_fingerprint = q.fp or "chrome"
-                srv.trojan_tls_insecure = (q.allowInsecure == "1") and "1" or "0"
+                srv.trojan_tls_insecure = (q.allowInsecure == "1" or q.insecure == "1") and "1" or "0"
             end
         end
 
@@ -591,15 +824,15 @@ local function parse_single_uri(line)
             srv.tcp_guise = (q.headerType == "http") and "http" or "none"
         elseif net == "ws" then
             srv.ws_host = q.host or ""
-            srv.ws_path = q.path or "/"
+            srv.ws_path = path_val
         elseif net == "grpc" then
             srv.grpc_service_name = q.serviceName or q.path or ""
         elseif net == "splithttp" then
             srv.splithttp_host = q.host or ""
-            srv.splithttp_path = q.path or "/"
+            srv.splithttp_path = path_val
         elseif net == "httpupgrade" then
             srv.httpupgrade_host = q.host or ""
-            srv.httpupgrade_path = q.path or "/"
+            srv.httpupgrade_path = path_val
         end
 
         return srv
@@ -617,13 +850,12 @@ function M.import_links(args)
         return { code = -1, error = "内容不能为空" }
     end
 
-    -- If input is a single HTTP/HTTPS subscription URL, fetch it via curl
+    -- If input is a single HTTP/HTTPS subscription URL, fetch it non-blockingly via ngx.pipe.spawn
     if input:match("^https?://[^%s]+$") then
-        local tmp = os.tmpname()
-        os.execute(string.format("curl -fsSL --connect-timeout 10 -m 20 -A 'v2rayN/6.45' '%s' -o '%s' 2>/dev/null", input:gsub("'", ""), tmp))
-        local body = read_file(tmp, 2 * 1024 * 1024) or ""
-        os.remove(tmp)
-        if body == "" then
+        local body = spawn_read({
+            "curl", "-fsSL", "--connect-timeout", "10", "-m", "20", "-A", "v2rayN/6.45", input
+        }, 22000)
+        if not body or trim(body) == "" then
             return { code = -1, error = "拉取订阅链接失败，请检查网络连接或直接从 v2rayN 复制节点分享链接粘贴导入" }
         end
         input = body
@@ -646,13 +878,18 @@ function M.import_links(args)
     end
 
     if #parsed_list == 0 then
-        return { code = -1, error = "未解析到有效节点（支持 ss://、vmess://、vless://、trojan:// 及 Base64 订阅内容）" }
+        return { code = -1, error = "未解析到有效节点（支持 ss://、vmess://、vless://、trojan://、hysteria2:// 及 Base64 订阅内容）" }
     end
 
     local c = uci.cursor()
+    local deleted_map = {}
     if args.replace_all then
         local to_del = {}
-        c:foreach("xray_core", "servers", function(s) to_del[#to_del + 1] = s[".name"] end)
+        c:foreach("xray_core", "servers", function(s)
+            local sid = s[".name"]
+            to_del[#to_del + 1] = sid
+            deleted_map[sid] = true
+        end)
         for _, id in ipairs(to_del) do c:delete("xray_core", id) end
     end
 
@@ -664,23 +901,25 @@ function M.import_links(args)
         apply_uci_fields(c, "xray_core", sec, srv)
     end
 
-    -- Ensure general balancer pools do not point to deleted server IDs after replace_all
     if args.replace_all and first_new_id then
+        cleanup_deleted_server_refs(c, deleted_map)
         local gen_id, gen = get_general_section(c)
-        local valid_ids = {}
-        c:foreach("xray_core", "servers", function(s) valid_ids[s[".name"]] = true end)
-        local keep_v4 = {}
-        if type(gen.tcp_balancer_v4) == "table" then
-            for _, id in ipairs(gen.tcp_balancer_v4) do
-                if valid_ids[id] then keep_v4[#keep_v4 + 1] = id end
-            end
+        if not gen.tcp_balancer_v4 or #gen.tcp_balancer_v4 == 0 then
+            c:set("xray_core", gen_id, "tcp_balancer_v4", { first_new_id })
         end
-        if #keep_v4 == 0 then keep_v4 = { first_new_id } end
-        c:set("xray_core", gen_id, "tcp_balancer_v4", keep_v4)
-        c:set("xray_core", gen_id, "udp_balancer_v4", keep_v4)
+        if not gen.udp_balancer_v4 or #gen.udp_balancer_v4 == 0 then
+            c:set("xray_core", gen_id, "udp_balancer_v4", { first_new_id })
+        end
     end
 
     c:commit("xray_core")
+    if args.replace_all then
+        local _, gen = get_general_section(c)
+        local _, proc_alive = get_xray_status(gen)
+        if proc_alive then
+            service_exec("restart")
+        end
+    end
     return { code = 0, data = { added = #parsed_list } }
 end
 
@@ -702,53 +941,59 @@ function M.save_subsection(args)
     local sec = args.id
     if not sec or sec == "" then
         sec = c:add("xray_core", args.type)
+    else
+        if c:get("xray_core", sec) ~= args.type then
+            return { code = -1, error = "目标配置段类型不匹配" }
+        end
     end
     apply_uci_fields(c, "xray_core", sec, args.values)
     c:commit("xray_core")
     if args.apply then
-        os.execute("/etc/init.d/xray_core restart >/dev/null 2>&1 &")
+        service_exec("restart")
     end
     return { code = 0, data = { id = sec } }
 end
 
 function M.delete_subsection(args)
-    if type(args) ~= "table" or type(args.id) ~= "string" then
+    if type(args) ~= "table" or type(args.id) ~= "string" or args.id == "" then
         return { code = -1, error = "未指定条目 ID" }
     end
     local c = uci.cursor()
+    local sec_type = c:get("xray_core", args.id)
+    if not sec_type or not allowed_sub_types[sec_type] then
+        return { code = -1, error = "不允许删除该类型配置段" }
+    end
     c:delete("xray_core", args.id)
     c:commit("xray_core")
     if args.apply then
-        os.execute("/etc/init.d/xray_core restart >/dev/null 2>&1 &")
+        service_exec("restart")
     end
     return { code = 0, data = { ok = true } }
 end
 
--- 8. Service control (start / stop / restart)
+-- 8. Service control (start / stop / restart) - waits synchronously via ngx.pipe.spawn
 function M.service_ctl(args)
     local action = (args and args.action) or "restart"
     if action ~= "start" and action ~= "stop" and action ~= "restart" then
         return { code = -1, error = "不支持的操作" }
     end
-    os.execute("/etc/init.d/xray_core " .. action .. " >/dev/null 2>&1 &")
+    service_exec(action)
     return { code = 0, data = { ok = true } }
 end
 
--- 9. Connectivity check (2s connect timeout, non-blocking feel)
+-- 9. Connectivity check (non-blocking via ngx.pipe.spawn)
 function M.test_connectivity(args)
     local target = (args and args.target == "cn")
         and "http://connectivitycheck.platform.hicloud.com/generate_204"
         or "https://www.google.com/generate_204"
 
-    local cmd = string.format(
-        "curl -s -o /dev/null -w '%%{http_code}:%%{time_total}' --connect-timeout 2 -m 3 '%s' 2>/dev/null",
-        target
-    )
-    local f = io.popen(cmd)
-    local out = f and f:read("*a") or ""
-    if f then f:close() end
+    local out = spawn_read({
+        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}:%{time_total}",
+        "--connect-timeout", "2", "-m", "3", target
+    }, 4000)
 
-    local code, time_s = out:match("^(%d+):([%d%.]+)$")
+    local code, time_s = trim(out):match("(%d+):([%d%.,]+)")
+    if time_s then time_s = time_s:gsub(",", ".") end
     local http_code = tonumber(code) or 0
     local ms = tonumber(time_s) and math.floor(tonumber(time_s) * 1000) or 0
 
@@ -765,9 +1010,7 @@ end
 -- 10. Read generated /var/etc/xray/config.json and recent xray system logs
 function M.get_preview()
     local cfg = read_file("/var/etc/xray/config.json", 256 * 1024) or "// /var/etc/xray/config.json 尚未生成（服务未启动）"
-    local f = io.popen("logread -e xray 2>/dev/null | tail -n 80")
-    local logs = f and f:read("*a") or ""
-    if f then f:close() end
+    local logs = spawn_read({ "/bin/sh", "-c", "logread -e xray 2>/dev/null | tail -n 80" }, 5000)
     return {
         code = 0,
         data = {
@@ -806,7 +1049,7 @@ else
     rm -f /tmp/geoip.dat.new /tmp/geosite.dat.new
 fi
 ]]
-    os.execute("(" .. script .. ") >/tmp/xray_geo_update.log 2>&1 &")
+    spawn_read({ "/bin/sh", "-c", "(" .. script .. ") >/tmp/xray_geo_update.log 2>&1 &" }, 2000)
     return { code = 0, data = { started = true } }
 end
 
