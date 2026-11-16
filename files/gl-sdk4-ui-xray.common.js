@@ -246,12 +246,12 @@
             metrics_server_enable: g.metrics_server_enable || "0",
             metrics_server_port: g.metrics_server_port || "18888",
             mark: g.mark || "255",
-            firewall_priority: g.firewall_priority || "10",
-            handshake: g.handshake || "4",
-            conn_idle: g.conn_idle || "300",
-            uplink_only: g.uplink_only || "2",
-            downlink_only: g.downlink_only || "5",
-            buffer_size: g.buffer_size || "512",
+            firewall_priority: g.firewall_priority || "",
+            handshake: g.handshake || "",
+            conn_idle: g.conn_idle || "",
+            uplink_only: g.uplink_only || "",
+            downlink_only: g.downlink_only || "",
+            buffer_size: g.buffer_size || "",
             dynamic_direct_tcp4: g.dynamic_direct_tcp4 || "0",
             dynamic_direct_udp4: g.dynamic_direct_udp4 || "0",
             custom_configuration_hook: g.custom_configuration_hook || ""
@@ -311,10 +311,11 @@
 
         return callRpc("save_general", { values: payload, apply: true }).then(function () {
           self.showToast("配置已保存并正在重启 Xray 服务...");
+          setTimeout(function () { self.refreshMetrics(); }, 1800);
           setTimeout(function () {
             self.loadAll();
             self.saving = false;
-          }, 2200);
+          }, 3500);
         }).catch(function (e) {
           self.showToast("保存失败: " + e.message);
           self.saving = false;
@@ -500,8 +501,8 @@
         }
         if (ed.tls_mode === "tls") {
           vals[p + "_tls_host"] = ed.tls_host;
-          vals[p + "_tls_insecure"] = ed.tls_insecure;
-          vals[p + "_tls_fingerprint"] = ed.tls_fingerprint;
+          vals[p + "_tls_insecure"] = ed.tls_insecure || "0";
+          vals[p + "_tls_fingerprint"] = ed.tls_fingerprint || "chrome";
         }
         if (ed.transport === "tcp") vals.tcp_guise = ed.tcp_guise;
         if (ed.transport === "ws") { vals.ws_host = ed.ws_host; vals.ws_path = ed.ws_path; }
@@ -510,7 +511,9 @@
         if (ed.transport === "httpupgrade") { vals.httpupgrade_host = ed.httpupgrade_host; vals.httpupgrade_path = ed.httpupgrade_path; }
         if (ed.transport === "hysteria") {
           vals.hysteria_up = ed.hysteria_up;
+          vals.hysteria_up_mbps = ed.hysteria_up;
           vals.hysteria_down = ed.hysteria_down;
+          vals.hysteria_down_mbps = ed.hysteria_down;
           vals.hysteria_udphop_port = ed.hysteria_udphop_port;
         }
 
@@ -792,7 +795,8 @@
           h("span", "核心透明代理开关、多节点负载均衡池与分流模式"),
           h("div", { class: "xgl-status-group" }, [
             h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("bypass_cn"); } } }, "一键预设：绕过中国大陆"),
-            h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("global"); } } }, "一键预设：全局代理")
+            h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("global"); } } }, "一键预设：全局代理"),
+            h("button", { class: "xgl-btn sm primary", on: { click: self.saveAllGeneral } }, self.saving ? "正在保存..." : "💾 保存并应用")
           ])
         ]),
         row("启用透明代理 (Enable Transparent Proxy)", "总开关：启用后自动配置 dnsmasq 与 nftables 将局域网设备流量按规则转入 Xray", flagSwitch(self.gen, "transparent_proxy_enable")),

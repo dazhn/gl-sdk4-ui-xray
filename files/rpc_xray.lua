@@ -387,13 +387,32 @@ function M.save_server(args)
     return { code = 0, data = { id = sec } }
 end
 
--- 5. Delete a server node
+-- 5. Delete a server node (and clean up any dangling reference in balancer pools)
 function M.delete_server(args)
     if type(args) ~= "table" or type(args.id) ~= "string" then
         return { code = -1, error = "未指定节点 ID" }
     end
     local c = uci.cursor()
     c:delete("xray_core", args.id)
+
+    local gen_id, gen = get_general_section(c)
+    if gen_id and gen then
+        for _, pool_key in ipairs({ "tcp_balancer_v4", "udp_balancer_v4", "tcp_balancer_v6", "udp_balancer_v6" }) do
+            local pool = gen[pool_key]
+            if type(pool) == "table" then
+                local filtered = {}
+                for _, item in ipairs(pool) do
+                    if item ~= args.id then filtered[#filtered + 1] = item end
+                end
+                if #filtered > 0 then
+                    c:set("xray_core", gen_id, pool_key, filtered)
+                else
+                    c:delete("xray_core", gen_id, pool_key)
+                end
+            end
+        end
+    end
+
     c:commit("xray_core")
     return { code = 0, data = { ok = true } }
 end
@@ -618,6 +637,18 @@ function M.import_links(args)
         end
     end
 
+    local parsed_list = {}
+    for line in input:gmatch("[^\r\n]+") do
+        local srv = parse_single_uri(line)
+        if srv then
+            parsed_list[#parsed_list + 1] = srv
+        end
+    end
+
+    if #parsed_list == 0 then
+        return { code = -1, error = "未解析到有效节点（支持 ss://、vmess://、vless://、trojan:// 及 Base64 订阅内容）" }
+    end
+
     local c = uci.cursor()
     if args.replace_all then
         local to_del = {}
@@ -625,23 +656,32 @@ function M.import_links(args)
         for _, id in ipairs(to_del) do c:delete("xray_core", id) end
     end
 
-    local added = 0
-    for line in input:gmatch("[^\r\n]+") do
-        local srv = parse_single_uri(line)
-        if srv then
-            local sec = next_server_id(c)
-            c:set("xray_core", sec, "servers")
-            apply_uci_fields(c, "xray_core", sec, srv)
-            added = added + 1
-        end
+    local first_new_id = nil
+    for _, srv in ipairs(parsed_list) do
+        local sec = next_server_id(c)
+        if not first_new_id then first_new_id = sec end
+        c:set("xray_core", sec, "servers")
+        apply_uci_fields(c, "xray_core", sec, srv)
     end
 
-    if added == 0 then
-        return { code = -1, error = "未解析到有效节点（支持 ss://、vmess://、vless://、trojan:// 及 Base64 订阅内容）" }
+    -- Ensure general balancer pools do not point to deleted server IDs after replace_all
+    if args.replace_all and first_new_id then
+        local gen_id, gen = get_general_section(c)
+        local valid_ids = {}
+        c:foreach("xray_core", "servers", function(s) valid_ids[s[".name"]] = true end)
+        local keep_v4 = {}
+        if type(gen.tcp_balancer_v4) == "table" then
+            for _, id in ipairs(gen.tcp_balancer_v4) do
+                if valid_ids[id] then keep_v4[#keep_v4 + 1] = id end
+            end
+        end
+        if #keep_v4 == 0 then keep_v4 = { first_new_id } end
+        c:set("xray_core", gen_id, "tcp_balancer_v4", keep_v4)
+        c:set("xray_core", gen_id, "udp_balancer_v4", keep_v4)
     end
 
     c:commit("xray_core")
-    return { code = 0, data = { added = added } }
+    return { code = 0, data = { added = #parsed_list } }
 end
 
 -- 7. Generic subsection CRUD (lan_hosts, extra_inbound, fakedns, manual_tproxy, bridge)

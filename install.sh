@@ -534,13 +534,32 @@ function M.save_server(args)
     return { code = 0, data = { id = sec } }
 end
 
--- 5. Delete a server node
+-- 5. Delete a server node (and clean up any dangling reference in balancer pools)
 function M.delete_server(args)
     if type(args) ~= "table" or type(args.id) ~= "string" then
         return { code = -1, error = "未指定节点 ID" }
     end
     local c = uci.cursor()
     c:delete("xray_core", args.id)
+
+    local gen_id, gen = get_general_section(c)
+    if gen_id and gen then
+        for _, pool_key in ipairs({ "tcp_balancer_v4", "udp_balancer_v4", "tcp_balancer_v6", "udp_balancer_v6" }) do
+            local pool = gen[pool_key]
+            if type(pool) == "table" then
+                local filtered = {}
+                for _, item in ipairs(pool) do
+                    if item ~= args.id then filtered[#filtered + 1] = item end
+                end
+                if #filtered > 0 then
+                    c:set("xray_core", gen_id, pool_key, filtered)
+                else
+                    c:delete("xray_core", gen_id, pool_key)
+                end
+            end
+        end
+    end
+
     c:commit("xray_core")
     return { code = 0, data = { ok = true } }
 end
@@ -765,6 +784,18 @@ function M.import_links(args)
         end
     end
 
+    local parsed_list = {}
+    for line in input:gmatch("[^\r\n]+") do
+        local srv = parse_single_uri(line)
+        if srv then
+            parsed_list[#parsed_list + 1] = srv
+        end
+    end
+
+    if #parsed_list == 0 then
+        return { code = -1, error = "未解析到有效节点（支持 ss://、vmess://、vless://、trojan:// 及 Base64 订阅内容）" }
+    end
+
     local c = uci.cursor()
     if args.replace_all then
         local to_del = {}
@@ -772,23 +803,32 @@ function M.import_links(args)
         for _, id in ipairs(to_del) do c:delete("xray_core", id) end
     end
 
-    local added = 0
-    for line in input:gmatch("[^\r\n]+") do
-        local srv = parse_single_uri(line)
-        if srv then
-            local sec = next_server_id(c)
-            c:set("xray_core", sec, "servers")
-            apply_uci_fields(c, "xray_core", sec, srv)
-            added = added + 1
-        end
+    local first_new_id = nil
+    for _, srv in ipairs(parsed_list) do
+        local sec = next_server_id(c)
+        if not first_new_id then first_new_id = sec end
+        c:set("xray_core", sec, "servers")
+        apply_uci_fields(c, "xray_core", sec, srv)
     end
 
-    if added == 0 then
-        return { code = -1, error = "未解析到有效节点（支持 ss://、vmess://、vless://、trojan:// 及 Base64 订阅内容）" }
+    -- Ensure general balancer pools do not point to deleted server IDs after replace_all
+    if args.replace_all and first_new_id then
+        local gen_id, gen = get_general_section(c)
+        local valid_ids = {}
+        c:foreach("xray_core", "servers", function(s) valid_ids[s[".name"]] = true end)
+        local keep_v4 = {}
+        if type(gen.tcp_balancer_v4) == "table" then
+            for _, id in ipairs(gen.tcp_balancer_v4) do
+                if valid_ids[id] then keep_v4[#keep_v4 + 1] = id end
+            end
+        end
+        if #keep_v4 == 0 then keep_v4 = { first_new_id } end
+        c:set("xray_core", gen_id, "tcp_balancer_v4", keep_v4)
+        c:set("xray_core", gen_id, "udp_balancer_v4", keep_v4)
     end
 
     c:commit("xray_core")
-    return { code = 0, data = { added = added } }
+    return { code = 0, data = { added = #parsed_list } }
 end
 
 -- 7. Generic subsection CRUD (lan_hosts, extra_inbound, fakedns, manual_tproxy, bridge)
@@ -1170,12 +1210,12 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
             metrics_server_enable: g.metrics_server_enable || "0",
             metrics_server_port: g.metrics_server_port || "18888",
             mark: g.mark || "255",
-            firewall_priority: g.firewall_priority || "10",
-            handshake: g.handshake || "4",
-            conn_idle: g.conn_idle || "300",
-            uplink_only: g.uplink_only || "2",
-            downlink_only: g.downlink_only || "5",
-            buffer_size: g.buffer_size || "512",
+            firewall_priority: g.firewall_priority || "",
+            handshake: g.handshake || "",
+            conn_idle: g.conn_idle || "",
+            uplink_only: g.uplink_only || "",
+            downlink_only: g.downlink_only || "",
+            buffer_size: g.buffer_size || "",
             dynamic_direct_tcp4: g.dynamic_direct_tcp4 || "0",
             dynamic_direct_udp4: g.dynamic_direct_udp4 || "0",
             custom_configuration_hook: g.custom_configuration_hook || ""
@@ -1235,10 +1275,11 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
 
         return callRpc("save_general", { values: payload, apply: true }).then(function () {
           self.showToast("配置已保存并正在重启 Xray 服务...");
+          setTimeout(function () { self.refreshMetrics(); }, 1800);
           setTimeout(function () {
             self.loadAll();
             self.saving = false;
-          }, 2200);
+          }, 3500);
         }).catch(function (e) {
           self.showToast("保存失败: " + e.message);
           self.saving = false;
@@ -1424,8 +1465,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         }
         if (ed.tls_mode === "tls") {
           vals[p + "_tls_host"] = ed.tls_host;
-          vals[p + "_tls_insecure"] = ed.tls_insecure;
-          vals[p + "_tls_fingerprint"] = ed.tls_fingerprint;
+          vals[p + "_tls_insecure"] = ed.tls_insecure || "0";
+          vals[p + "_tls_fingerprint"] = ed.tls_fingerprint || "chrome";
         }
         if (ed.transport === "tcp") vals.tcp_guise = ed.tcp_guise;
         if (ed.transport === "ws") { vals.ws_host = ed.ws_host; vals.ws_path = ed.ws_path; }
@@ -1434,7 +1475,9 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         if (ed.transport === "httpupgrade") { vals.httpupgrade_host = ed.httpupgrade_host; vals.httpupgrade_path = ed.httpupgrade_path; }
         if (ed.transport === "hysteria") {
           vals.hysteria_up = ed.hysteria_up;
+          vals.hysteria_up_mbps = ed.hysteria_up;
           vals.hysteria_down = ed.hysteria_down;
+          vals.hysteria_down_mbps = ed.hysteria_down;
           vals.hysteria_udphop_port = ed.hysteria_udphop_port;
         }
 
@@ -1716,7 +1759,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           h("span", "核心透明代理开关、多节点负载均衡池与分流模式"),
           h("div", { class: "xgl-status-group" }, [
             h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("bypass_cn"); } } }, "一键预设：绕过中国大陆"),
-            h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("global"); } } }, "一键预设：全局代理")
+            h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("global"); } } }, "一键预设：全局代理"),
+            h("button", { class: "xgl-btn sm primary", on: { click: self.saveAllGeneral } }, self.saving ? "正在保存..." : "💾 保存并应用")
           ])
         ]),
         row("启用透明代理 (Enable Transparent Proxy)", "总开关：启用后自动配置 dnsmasq 与 nftables 将局域网设备流量按规则转入 Xray", flagSwitch(self.gen, "transparent_proxy_enable")),
