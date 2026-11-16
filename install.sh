@@ -1153,6 +1153,17 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         this[poolKey] = arr;
       },
 
+      toggleCombinedPool: function (srvId) {
+        var inPool = this.tcpNodesV4.indexOf(srvId) >= 0 || this.udpNodesV4.indexOf(srvId) >= 0;
+        if (inPool) {
+          this.tcpNodesV4 = this.tcpNodesV4.filter(function (x) { return x !== srvId; });
+          this.udpNodesV4 = this.udpNodesV4.filter(function (x) { return x !== srvId; });
+        } else {
+          if (this.tcpNodesV4.indexOf(srvId) < 0) this.tcpNodesV4 = this.tcpNodesV4.concat([srvId]);
+          if (this.udpNodesV4.indexOf(srvId) < 0) this.udpNodesV4 = this.udpNodesV4.concat([srvId]);
+        }
+      },
+
       openEditServer: function (srv) {
         if (!srv) {
           this.editingServer = {
@@ -1538,9 +1549,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         ["status", "1. 基本设置与节点订阅 (" + self.servers.length + ")"],
         ["dns", "2. DNS 与 FakeDNS"],
         ["routing", "3. 出站规则与流量嗅探"],
-        ["lan", "4. 局域网设备与入站"],
-        ["advanced", "5. 高级参数与监控"],
-        ["preview", "6. 配置预览与日志"]
+        ["advanced", "4. 高级参数与监控"],
+        ["preview", "5. 配置预览与日志"]
       ];
       var tabBar = h("div", { class: "xgl-tabs" }, tabs.map(function (t) {
         return h("div", {
@@ -1623,15 +1633,14 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         ]) : null,
 
         h("div", { class: "xgl-table-wrap" }, [
-          h("table", { class: "xgl-table" }, [
+          h("table", { class: "xgl-table", style: { tableLayout: "fixed" } }, [
             h("thead", [
               h("tr", [
-                h("th", "ID"),
-                h("th", "节点别名 (Alias)"),
-                h("th", "协议"),
-                h("th", "传输 / 安全"),
-                h("th", "服务器地址 : 端口"),
-                h("th", { style: { textAlign: "right" } }, "快捷单选 / 负载池多选 / 操作")
+                h("th", { style: { width: "26%" } }, "节点别名 (Alias)"),
+                h("th", { style: { width: "68px", whiteSpace: "nowrap" } }, "协议"),
+                h("th", { style: { width: "92px", whiteSpace: "nowrap" } }, "传输/安全"),
+                h("th", { style: { width: "28%" } }, "服务器地址 : 端口"),
+                h("th", { style: { width: "270px", textAlign: "right", whiteSpace: "nowrap" } }, "快捷单选 / 负载池多选 / 操作")
               ])
             ]),
             h("tbody", filteredServers.map(function (srv) {
@@ -1642,37 +1651,30 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
               var p = srv.protocol || "";
               var tls = srv[p + "_tls"] || "none";
               return h("tr", { key: id, class: isCurrent ? "active-row" : "" }, [
-                h("td", id),
-                h("td", [
+                h("td", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, [
                   h("strong", srv.alias || "-"),
-                  inTcp ? h("span", { class: "xgl-badge ok", style: { marginLeft: "6px" } }, "TCP") : null,
-                  inUdp ? h("span", { class: "xgl-badge info", style: { marginLeft: "4px" } }, "UDP") : null
+                  inTcp ? h("span", { class: "xgl-badge ok", style: { marginLeft: "6px", padding: "2px 7px" } }, "TCP") : null,
+                  inUdp ? h("span", { class: "xgl-badge info", style: { marginLeft: "4px", padding: "2px 7px" } }, "UDP") : null
                 ]),
-                h("td", p.toUpperCase()),
-                h("td", (srv.transport || "tcp").toUpperCase() + (tls !== "none" ? " + " + tls.toUpperCase() : "")),
-                h("td", (srv.server || "") + ":" + firstItem(srv.server_port)),
+                h("td", { style: { whiteSpace: "nowrap", fontSize: "12px" } }, p === "shadowsocks" ? "SS" : p.toUpperCase()),
+                h("td", { style: { whiteSpace: "nowrap", fontSize: "12px" } }, (srv.transport || "tcp").toUpperCase() + (tls !== "none" ? "+" + tls.toUpperCase() : "")),
+                h("td", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: "12px" }, attrs: { title: (srv.server || "") + ":" + firstItem(srv.server_port) } }, (srv.server || "") + ":" + firstItem(srv.server_port)),
                 h("td", { style: { textAlign: "right", whiteSpace: "nowrap" } }, [
                   h("button", {
                     class: "xgl-btn sm success",
-                    style: { marginRight: "5px" },
+                    style: { marginRight: "6px" },
                     attrs: { title: "将该节点设为唯一的 TCP+UDP 主节点并立即重启生效" },
                     on: { click: function () { self.quickUseServer(id); } }
                   }, "单选启用"),
                   h("button", {
-                    class: "xgl-btn sm " + (inTcp ? "primary" : ""),
-                    style: { marginRight: "5px" },
-                    attrs: { title: "加入或移出上方 TCP (IPv4) 负载均衡池" },
-                    on: { click: function () { self.togglePoolNode("tcpNodesV4", id); } }
-                  }, inTcp ? "✓ TCP池" : "+TCP池"),
-                  h("button", {
-                    class: "xgl-btn sm " + (inUdp ? "primary" : ""),
-                    style: { marginRight: "5px" },
-                    attrs: { title: "加入或移出上方 UDP (IPv4) 负载均衡池" },
-                    on: { click: function () { self.togglePoolNode("udpNodesV4", id); } }
-                  }, inUdp ? "✓ UDP池" : "+UDP池"),
+                    class: "xgl-btn sm " + (isCurrent ? "primary" : ""),
+                    style: { marginRight: "6px" },
+                    attrs: { title: "加入或移出上方 TCP+UDP 负载均衡节点池" },
+                    on: { click: function () { self.toggleCombinedPool(id); } }
+                  }, isCurrent ? "✓ 节点池" : "+节点池"),
                   h("button", {
                     class: "xgl-btn sm",
-                    style: { marginRight: "5px" },
+                    style: { marginRight: "6px" },
                     on: { click: function () { self.openEditServer(srv); } }
                   }, "编辑"),
                   h("button", {
@@ -1686,7 +1688,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         ])
       ]);
 
-      // Tab 3: DNS & FakeDNS
+      // Tab 2: DNS & FakeDNS
       var tabDns = h("div", [
         h("div", { class: "xgl-section-title" }, [
           h("span", "分流 DNS 与去广告域名规则"),
@@ -1725,7 +1727,10 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         row("FakeDNS IPv6 容量 (Pool v6 Size)", "默认 65535", textInput(self.gen, "pool_v6_size", "65535"))
       ]);
 
-      // Tab 4: Outbound Routing & Sniffing
+      // Tab 3: Outbound Routing, Sniffing, LAN Hosts & Extra Inbounds (Merged)
+      var lanList = self.subsections.lan_hosts || [];
+      var extraInbounds = self.subsections.extra_inbound || [];
+
       var tabRouting = h("div", [
         h("div", { class: "xgl-section-title" }, "GeoIP 国家代码与 IP/端口分流规则"),
         row("GeoIP 直连代码列表 (IPv4)", "每行一个代码，如 cn（中国大陆 IP 直连）或 telegram；留空则全部非私网 IP 走代理", h("textarea", {
@@ -1767,25 +1772,9 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           ["AsIs", "AsIs (仅按域名匹配，最快)"],
           ["IPIfNonMatch", "IPIfNonMatch (域名未命中时解析 IP 匹配)"],
           ["IPOnDemand", "IPOnDemand (遇到 IP 规则时按需解析)"]
-        ]))
-      ]);
-
-      // Tab 5: LAN Hosts Access Control & Inbounds
-      var lanList = self.subsections.lan_hosts || [];
-      var extraInbounds = self.subsections.extra_inbound || [];
-
-      var tabLan = h("div", [
-        h("div", { class: "xgl-section-title" }, "透明代理监听网卡与端口 (Inbounds)"),
-        row("启用 IPv4 透明代理的接口", "默认 br-lan（代表整个局域网桥接接口）", textInput(self, "tproxyIfacesV4Text", "br-lan")),
-        row("启用 IPv6 透明代理的接口", "默认 br-lan", textInput(self, "tproxyIfacesV6Text", "br-lan")),
-        row("透明代理内部端口 (TCP4 / UDP4 / TCP6 / UDP6)", "Xray 内部 Dokodemo-door 监听端口，一般保持默认 1082~1085 即可", h("div", { style: { display: "flex", gap: "6px", width: "100%" } }, [
-          textInput(self.gen, "tproxy_port_tcp_v4", "1082"),
-          textInput(self.gen, "tproxy_port_udp_v4", "1084"),
-          textInput(self.gen, "tproxy_port_tcp_v6", "1083"),
-          textInput(self.gen, "tproxy_port_udp_v6", "1085")
         ])),
 
-        h("div", { class: "xgl-section-title" }, "局域网设备独立分流控制 (LAN Hosts Access Control)"),
+        h("div", { class: "xgl-section-title", style: { marginTop: "24px" } }, "局域网设备独立分流控制 (LAN Hosts Access Control)"),
         h("div", { class: "xgl-desc", style: { marginBottom: "10px" } }, "可针对家里特定设备（如智能电视、游戏机、NAS 或工作电脑）单独指定“完全直连不走代理 (bypass)”或“启用透明代理 (tproxy)”："),
         h("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center", marginBottom: "12px" } }, [
           h("select", {
@@ -2050,7 +2039,6 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
       var activeView = tabStatus;
       if (self.activeTab === "dns") activeView = tabDns;
       else if (self.activeTab === "routing") activeView = tabRouting;
-      else if (self.activeTab === "lan") activeView = tabLan;
       else if (self.activeTab === "advanced") activeView = tabAdvanced;
       else if (self.activeTab === "preview") activeView = tabPreview;
 
