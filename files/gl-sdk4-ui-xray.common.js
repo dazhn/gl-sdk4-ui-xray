@@ -1069,8 +1069,8 @@
         row("自定义 ucode 配置钩子 (Custom Configuration Hook)", "高级用户在生成 config.json 前动态修改配置对象的 ucode 函数", autoTextarea(self.gen, "custom_configuration_hook", "return function(config) { return config; };"))
       ]);
 
-      // Tab 7: Config Preview & Logs
-      var luciHref = window.location.protocol + "//" + window.location.hostname + ":8080/cgi-bin/luci/admin/services/xray";
+      // Tab 4: Config Preview & Logs
+      var luciHref = "http://" + window.location.hostname + ":8080/cgi-bin/luci/admin/services/xray_core";
       var tabPreview = h("div", [
         h("div", { class: "xgl-section-title" }, [
           h("span", "Xray 实时系统日志 (logread -e xray)"),
