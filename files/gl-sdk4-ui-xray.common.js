@@ -677,46 +677,25 @@
 
       function multiNodeSelector(poolKey) {
         var selected = self[poolKey] || [];
-        return h("div", { style: { width: "100%", display: "flex", flexDirection: "column", gap: "8px" } }, [
-          h("div", { style: { display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center" } },
-            selected.length > 0 ? selected.map(function (id) {
-              return h("span", {
-                key: id,
-                class: "xgl-badge ok",
-                style: { cursor: "pointer", userSelect: "none" },
-                attrs: { title: "点击从池中移除该节点" },
-                on: { click: function () { self.togglePoolNode(poolKey, id); } }
-              }, serverAliasById(id) + " ✕");
-            }).concat([
-              h("button", {
-                class: "xgl-btn sm",
-                style: { padding: "2px 8px", fontSize: "11px" },
-                on: { click: function () { self[poolKey] = []; } }
-              }, "清空")
-            ]) : [
-              h("span", { class: "xgl-desc" }, "未选择节点（当前方向不启用代理）")
-            ]
-          ),
-          h("select", {
-            class: "xgl-select",
-            domProps: { value: "" },
-            on: {
-              change: function (e) {
-                var val = e.target.value;
-                if (val && self[poolKey].indexOf(val) < 0) {
-                  self[poolKey] = self[poolKey].concat([val]);
-                }
-                e.target.value = "";
-              }
-            }
-          }, [
-            h("option", { domProps: { value: "" } }, "+ 点击添加节点到此池 (可选多个组成负载均衡)...")
-          ].concat(self.servers.map(function (s) {
-            var id = s[".name"];
-            var inPool = self[poolKey].indexOf(id) >= 0;
-            return h("option", { domProps: { value: id, disabled: inPool } }, (inPool ? "✓ " : "") + (s.alias || s.server) + " [" + (s.protocol || "").toUpperCase() + "]");
-          })))
-        ]);
+        return h("div", { style: { width: "100%", display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center", justifyContent: "flex-end" } },
+          selected.length > 0 ? selected.map(function (id) {
+            return h("span", {
+              key: id,
+              class: "xgl-badge ok",
+              style: { cursor: "pointer", userSelect: "none" },
+              attrs: { title: "点击从池中移除该节点" },
+              on: { click: function () { self.togglePoolNode(poolKey, id); } }
+            }, serverAliasById(id) + " ✕");
+          }).concat([
+            h("button", {
+              class: "xgl-btn sm",
+              style: { padding: "2px 8px", fontSize: "11px" },
+              on: { click: function () { self[poolKey] = []; } }
+            }, "清空")
+          ]) : [
+            h("span", { class: "xgl-desc" }, "未添加节点（请在下方节点列表中点击 +IPv4池 / +IPv6池 添加）")
+          ]
+        );
       }
 
       // Top status bar
@@ -831,35 +810,38 @@
                 h("th", { style: { width: "68px", whiteSpace: "nowrap" } }, "协议"),
                 h("th", { style: { width: "92px", whiteSpace: "nowrap" } }, "传输/安全"),
                 h("th", { style: { width: "28%" } }, "服务器地址 : 端口"),
-                h("th", { style: { width: "270px", textAlign: "right", whiteSpace: "nowrap" } }, "快捷单选 / 负载池多选 / 操作")
+                h("th", { style: { width: "270px", textAlign: "right", whiteSpace: "nowrap" } }, "负载池多选 / 操作")
               ])
             ]),
             h("tbody", filteredServers.map(function (srv) {
               var id = srv[".name"];
-              var isCurrent = self.tcpNodesV4.indexOf(id) >= 0;
+              var inV4 = self.tcpNodesV4.indexOf(id) >= 0;
+              var inV6 = self.tcpNodesV6.indexOf(id) >= 0;
+              var isCurrent = inV4 || inV6;
               var p = srv.protocol || "";
               var tls = srv[p + "_tls"] || "none";
               return h("tr", { key: id, class: isCurrent ? "active-row" : "" }, [
                 h("td", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, [
                   h("strong", srv.alias || "-"),
-                  isCurrent ? h("span", { class: "xgl-badge ok", style: { marginLeft: "6px", padding: "2px 7px" } }, "已启用") : null
+                  inV4 ? h("span", { class: "xgl-badge ok", style: { marginLeft: "6px", padding: "2px 7px" } }, "IPv4") : null,
+                  inV6 ? h("span", { class: "xgl-badge info", style: { marginLeft: "4px", padding: "2px 7px" } }, "IPv6") : null
                 ]),
                 h("td", { style: { whiteSpace: "nowrap", fontSize: "12px" } }, p === "shadowsocks" ? "SS" : p.toUpperCase()),
                 h("td", { style: { whiteSpace: "nowrap", fontSize: "12px" } }, (srv.transport || "tcp").toUpperCase() + (tls !== "none" ? "+" + tls.toUpperCase() : "")),
                 h("td", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: "12px" }, attrs: { title: (srv.server || "") + ":" + firstItem(srv.server_port) } }, (srv.server || "") + ":" + firstItem(srv.server_port)),
                 h("td", { style: { textAlign: "right", whiteSpace: "nowrap" } }, [
                   h("button", {
-                    class: "xgl-btn sm success",
+                    class: "xgl-btn sm " + (inV4 ? "success" : ""),
                     style: { marginRight: "6px" },
-                    attrs: { title: "将该节点设为唯一的 TCP+UDP 主节点并立即重启生效" },
-                    on: { click: function () { self.quickUseServer(id); } }
-                  }, "单选启用"),
+                    attrs: { title: "加入或移出上方 IPv4 TCP/UDP 负载均衡池" },
+                    on: { click: function () { self.togglePoolNode("tcpNodesV4", id); } }
+                  }, inV4 ? "✓ IPv4池" : "+IPv4池"),
                   h("button", {
-                    class: "xgl-btn sm " + (isCurrent ? "primary" : ""),
+                    class: "xgl-btn sm " + (inV6 ? "primary" : ""),
                     style: { marginRight: "6px" },
-                    attrs: { title: "加入或移出上方 TCP+UDP 负载均衡节点池" },
-                    on: { click: function () { self.toggleCombinedPool(id); } }
-                  }, isCurrent ? "✓ 节点池" : "+节点池"),
+                    attrs: { title: "加入或移出上方 IPv6 TCP/UDP 负载均衡池" },
+                    on: { click: function () { self.togglePoolNode("tcpNodesV6", id); } }
+                  }, inV6 ? "✓ IPv6池" : "+IPv6池"),
                   h("button", {
                     class: "xgl-btn sm",
                     style: { marginRight: "6px" },
