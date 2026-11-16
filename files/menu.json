@@ -1,0 +1,12 @@
+{
+    "index": 10,
+    "view": "xray",
+    "title": "Xray 透明代理",
+    "level": 2,
+    "parent": "applications",
+    "parent_icon": "application",
+    "parent_index": 55,
+    "show_mode": [
+        "router"
+    ]
+}
