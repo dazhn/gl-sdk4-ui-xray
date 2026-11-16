@@ -13,5 +13,6 @@ return {
     service_ctl = true,
     test_connectivity = true,
     get_preview = true,
-    update_geodata = true
+    update_geodata = true,
+    get_metrics = true
 }

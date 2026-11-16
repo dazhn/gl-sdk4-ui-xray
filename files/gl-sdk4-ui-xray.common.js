@@ -97,6 +97,14 @@
     return [];
   }
 
+  function fmtBytes(b) {
+    var n = Number(b) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(2) + " MB";
+    return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+  }
+
   var XrayApp = {
     name: "GlSdk4UiXray",
     data: function () {
@@ -111,6 +119,8 @@
         geoip_size: "0 MB",
         geosite_ok: false,
         geosite_size: "0 MB",
+        metrics: null,
+        metricsTimer: null,
         cnPing: null,
         googlePing: null,
 
@@ -164,9 +174,26 @@
       };
     },
     created: function () {
-      this.loadAll();
+      var self = this;
+      self.loadAll();
+      self.metricsTimer = setInterval(function () {
+        self.refreshMetrics();
+      }, 5000);
+    },
+    beforeDestroy: function () {
+      if (this.metricsTimer) {
+        clearInterval(this.metricsTimer);
+        this.metricsTimer = null;
+      }
     },
     methods: {
+      refreshMetrics: function () {
+        var self = this;
+        callRpc("get_metrics", {}).then(function (d) {
+          self.running = !!d.running;
+          self.metrics = d.metrics || null;
+        }).catch(function () {});
+      },
       showToast: function (msg) {
         var self = this;
         self.toastMsg = msg;
@@ -183,6 +210,7 @@
           self.geoip_size = d.geoip_size || "0 MB";
           self.geosite_ok = !!d.geosite_ok;
           self.geosite_size = d.geosite_size || "0 MB";
+          self.metrics = d.metrics || null;
           var g = d.general || {};
           self.gen = {
             transparent_proxy_enable: g.transparent_proxy_enable || "0",
@@ -677,15 +705,22 @@
 
       function multiNodeSelector(poolKey) {
         var selected = self[poolKey] || [];
+        var nodeMap = (self.metrics && self.metrics.nodes) || {};
         return h("div", { style: { width: "100%", display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center", justifyContent: "flex-end" } },
           selected.length > 0 ? selected.map(function (id) {
+            var nm = nodeMap[id];
+            var statText = "";
+            if (nm) {
+              if (nm.delay > 0) statText += " · " + nm.delay + "ms";
+              if (nm.down > 0 || nm.up > 0) statText += " · ↓" + fmtBytes(nm.down) + " ↑" + fmtBytes(nm.up);
+            }
             return h("span", {
               key: id,
-              class: "xgl-badge ok",
+              class: "xgl-badge " + (nm && nm.alive === false ? "err" : "ok"),
               style: { cursor: "pointer", userSelect: "none" },
               attrs: { title: "点击从池中移除该节点" },
               on: { click: function () { self.togglePoolNode(poolKey, id); } }
-            }, serverAliasById(id) + " ✕");
+            }, serverAliasById(id) + statText + " ✕");
           }).concat([
             h("button", {
               class: "xgl-btn sm",
@@ -699,13 +734,21 @@
       }
 
       // Top status bar
+      var m = self.metrics;
       var topBar = h("div", { class: "xgl-topbar" }, [
         h("div", { class: "xgl-status-group" }, [
-          h("span", { class: "xgl-badge " + (self.running ? "ok" : "err") }, self.running ? "● Xray 运行中" : "○ Xray 已停止"),
+          h("span", { class: "xgl-badge " + (self.running ? "ok" : "err") },
+            self.running ? ("● Xray 运行中" + (m && m.mem_mb ? " (" + m.mem_mb + ")" : "")) : "○ Xray 已停止"
+          ),
+          m ? h("span", { class: "xgl-badge ok" }, "代理流量: ↓" + fmtBytes(m.proxy_down) + " / ↑" + fmtBytes(m.proxy_up)) : null,
+          m ? h("span", { class: "xgl-badge info" }, "直连流量: ↓" + fmtBytes(m.direct_down) + " / ↑" + fmtBytes(m.direct_up)) : null,
+          (m && m.direct_delay != null) ? h("span", { class: "xgl-badge " + (m.direct_delay > 0 ? "ok" : "err") },
+            "直连观测: " + (m.direct_delay > 0 ? m.direct_delay + "ms" : "超时")
+          ) : null,
           h("span", { class: "xgl-badge " + (self.geoip_ok ? "info" : "err") }, "GeoIP: " + self.geoip_size),
           h("span", { class: "xgl-badge " + (self.geosite_ok ? "info" : "err") }, "GeoSite: " + self.geosite_size),
-          self.cnPing ? h("span", { class: "xgl-badge " + (self.cnPing.ok ? "ok" : "err") }, "国内: " + (self.cnPing.ok ? self.cnPing.latency_ms + "ms" : "不通")) : null,
-          self.googlePing ? h("span", { class: "xgl-badge " + (self.googlePing.ok ? "ok" : "err") }, "Google: " + (self.googlePing.ok ? self.googlePing.latency_ms + "ms" : "不通")) : null
+          self.cnPing ? h("span", { class: "xgl-badge " + (self.cnPing.ok ? "ok" : "err") }, "国内测速: " + (self.cnPing.ok ? self.cnPing.latency_ms + "ms" : "不通")) : null,
+          self.googlePing ? h("span", { class: "xgl-badge " + (self.googlePing.ok ? "ok" : "err") }, "Google测速: " + (self.googlePing.ok ? self.googlePing.latency_ms + "ms" : "不通")) : null
         ]),
         h("div", { class: "xgl-status-group" }, [
           h("button", { class: "xgl-btn sm", on: { click: self.runPingTest } }, self.testing ? "测速中..." : "⚡ 连通性测速"),
@@ -818,13 +861,15 @@
               var inV4 = self.tcpNodesV4.indexOf(id) >= 0;
               var inV6 = self.tcpNodesV6.indexOf(id) >= 0;
               var isCurrent = inV4 || inV6;
+              var nm = (self.metrics && self.metrics.nodes && self.metrics.nodes[id]) || null;
               var p = srv.protocol || "";
               var tls = srv[p + "_tls"] || "none";
               return h("tr", { key: id, class: isCurrent ? "active-row" : "" }, [
                 h("td", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, [
                   h("strong", srv.alias || "-"),
                   inV4 ? h("span", { class: "xgl-badge ok", style: { marginLeft: "6px", padding: "2px 7px" } }, "IPv4") : null,
-                  inV6 ? h("span", { class: "xgl-badge info", style: { marginLeft: "4px", padding: "2px 7px" } }, "IPv6") : null
+                  inV6 ? h("span", { class: "xgl-badge info", style: { marginLeft: "4px", padding: "2px 7px" } }, "IPv6") : null,
+                  (nm && nm.delay > 0) ? h("span", { class: "xgl-badge ok", style: { marginLeft: "4px", padding: "2px 7px" } }, nm.delay + "ms") : null
                 ]),
                 h("td", { style: { whiteSpace: "nowrap", fontSize: "12px" } }, p === "shadowsocks" ? "SS" : p.toUpperCase()),
                 h("td", { style: { whiteSpace: "nowrap", fontSize: "12px" } }, (srv.transport || "tcp").toUpperCase() + (tls !== "none" ? "+" + tls.toUpperCase() : "")),

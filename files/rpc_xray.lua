@@ -147,6 +147,82 @@ local function apply_uci_fields(c, pkg, sec, values)
     end
 end
 
+local function fetch_metrics_summary(port)
+    port = tonumber(port) or 18888
+    local f = io.popen(string.format("curl -s --connect-timeout 1 -m 2 http://127.0.0.1:%d/debug/vars 2>/dev/null", port))
+    local raw = f and f:read("*a") or ""
+    if f then f:close() end
+    if raw == "" then return nil end
+
+    local ok, j = pcall(cjson.decode, raw)
+    if not ok or type(j) ~= "table" then return nil end
+
+    local mem_mb = "0 MB"
+    if type(j.memstats) == "table" and tonumber(j.memstats.Alloc) then
+        mem_mb = string.format("%.1f MB", tonumber(j.memstats.Alloc) / (1024 * 1024))
+    end
+
+    local direct_delay = nil
+    local nodes = {}
+
+    if type(j.observatory) == "table" then
+        for tag, info in pairs(j.observatory) do
+            if type(info) == "table" then
+                if tag == "direct" then
+                    direct_delay = info.alive and tonumber(info.delay) or -1
+                else
+                    local srv_id = tag:match(":(srv_%d+)$")
+                    if srv_id then
+                        nodes[srv_id] = nodes[srv_id] or { alive = false, delay = 0, up = 0, down = 0 }
+                        if info.alive then
+                            nodes[srv_id].alive = true
+                            local d = tonumber(info.delay) or 0
+                            if nodes[srv_id].delay == 0 or (d > 0 and d < nodes[srv_id].delay) then
+                                nodes[srv_id].delay = d
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local proxy_up, proxy_down = 0, 0
+    local direct_up, direct_down = 0, 0
+
+    if type(j.stats) == "table" and type(j.stats.outbound) == "table" then
+        for tag, st in pairs(j.stats.outbound) do
+            if type(st) == "table" then
+                local up = tonumber(st.uplink) or 0
+                local down = tonumber(st.downlink) or 0
+                if tag == "direct" or tag == "dynamic_direct" then
+                    direct_up = direct_up + up
+                    direct_down = direct_down + down
+                else
+                    local srv_id = tag:match(":(srv_%d+)$")
+                    if srv_id then
+                        proxy_up = proxy_up + up
+                        proxy_down = proxy_down + down
+                        nodes[srv_id] = nodes[srv_id] or { alive = true, delay = 0, up = 0, down = 0 }
+                        nodes[srv_id].up = nodes[srv_id].up + up
+                        nodes[srv_id].down = nodes[srv_id].down + down
+                    end
+                end
+            end
+        end
+    end
+
+    return {
+        mem_mb = mem_mb,
+        direct_delay = direct_delay,
+        proxy_up = proxy_up,
+        proxy_down = proxy_down,
+        direct_up = direct_up,
+        direct_down = direct_down,
+        nodes = nodes
+    }
+end
+
 -- 1. Get complete UCI state + runtime status + LAN clients
 function M.get_all()
     local c = uci.cursor()
@@ -175,20 +251,36 @@ function M.get_all()
 
     local geoip_ok, geoip_sz = file_size_mb("/usr/share/xray/geoip.dat")
     local geosite_ok, geosite_sz = file_size_mb("/usr/share/xray/geosite.dat")
+    local running = is_xray_running()
+    local metrics = running and fetch_metrics_summary(gen.metrics_server_port) or nil
 
     return {
         code = 0,
         data = {
-            running = is_xray_running(),
+            running = running,
             geoip_ok = geoip_ok,
             geoip_size = geoip_sz,
             geosite_ok = geosite_ok,
             geosite_size = geosite_sz,
+            metrics = metrics,
             general_id = gen_id,
             general = clean_uci_section(gen),
             servers = servers,
             subsections = subsections,
             lan_clients = get_lan_clients()
+        }
+    }
+end
+
+function M.get_metrics()
+    local c = uci.cursor()
+    local _, gen = get_general_section(c)
+    local running = is_xray_running()
+    return {
+        code = 0,
+        data = {
+            running = running,
+            metrics = running and fetch_metrics_summary(gen and gen.metrics_server_port) or nil
         }
     }
 end
