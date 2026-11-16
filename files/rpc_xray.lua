@@ -737,16 +737,36 @@ function M.get_preview()
     }
 end
 
--- 11. Online update GeoIP / GeoSite from Loyalsoldier/v2ray-rules-dat
+-- 11. Online update GeoIP / GeoSite from Loyalsoldier/v2ray-rules-dat (with domestic mirror & CDN fallback)
 function M.update_geodata()
-    local cmd = "("
-        .. "curl -fsSL --connect-timeout 10 -m 120 -o /tmp/geoip.dat.new https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat && "
-        .. "curl -fsSL --connect-timeout 10 -m 120 -o /tmp/geosite.dat.new https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat && "
-        .. "mv /tmp/geoip.dat.new /usr/share/xray/geoip.dat && "
-        .. "mv /tmp/geosite.dat.new /usr/share/xray/geosite.dat && "
-        .. "/etc/init.d/xray_core restart"
-        .. ") >/tmp/xray_geo_update.log 2>&1 &"
-    os.execute(cmd)
+    local script = [[
+mkdir -p /usr/share/xray
+dl() {
+    local name="$1"
+    local out="$2"
+    for url in \
+        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${name}" \
+        "https://ghfast.top/https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${name}" \
+        "https://gh-proxy.com/https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${name}" \
+        "https://testingcf.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/${name}"; do
+        if curl -fsSL --connect-timeout 8 -m 120 -o "$out" "$url" 2>/dev/null; then
+            local sz=$(wc -c < "$out" 2>/dev/null || echo 0)
+            if [ "$sz" -gt 1000000 ]; then
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+if dl "geoip.dat" "/tmp/geoip.dat.new" && dl "geosite.dat" "/tmp/geosite.dat.new"; then
+    mv /tmp/geoip.dat.new /usr/share/xray/geoip.dat
+    mv /tmp/geosite.dat.new /usr/share/xray/geosite.dat
+    /etc/init.d/xray_core restart
+else
+    rm -f /tmp/geoip.dat.new /tmp/geosite.dat.new
+fi
+]]
+    os.execute("(" .. script .. ") >/tmp/xray_geo_update.log 2>&1 &")
     return { code = 0, data = { started = true } }
 end
 
