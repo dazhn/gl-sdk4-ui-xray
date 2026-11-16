@@ -263,9 +263,9 @@
         self.saving = true;
         var payload = Object.assign({}, self.gen, {
           tcp_balancer_v4: self.tcpNodesV4,
-          udp_balancer_v4: self.udpNodesV4,
+          udp_balancer_v4: self.tcpNodesV4,
           tcp_balancer_v6: self.tcpNodesV6,
-          udp_balancer_v6: self.udpNodesV6,
+          udp_balancer_v6: self.tcpNodesV6,
           bypassed_domain_rules: linesToArr(self.bypassedRulesText),
           forwarded_domain_rules: linesToArr(self.forwardedRulesText),
           blocked_domain_rules: linesToArr(self.blockedRulesText),
@@ -343,14 +343,7 @@
       },
 
       toggleCombinedPool: function (srvId) {
-        var inPool = this.tcpNodesV4.indexOf(srvId) >= 0 || this.udpNodesV4.indexOf(srvId) >= 0;
-        if (inPool) {
-          this.tcpNodesV4 = this.tcpNodesV4.filter(function (x) { return x !== srvId; });
-          this.udpNodesV4 = this.udpNodesV4.filter(function (x) { return x !== srvId; });
-        } else {
-          if (this.tcpNodesV4.indexOf(srvId) < 0) this.tcpNodesV4 = this.tcpNodesV4.concat([srvId]);
-          if (this.udpNodesV4.indexOf(srvId) < 0) this.udpNodesV4 = this.udpNodesV4.concat([srvId]);
-        }
+        this.togglePoolNode("tcpNodesV4", srvId);
       },
 
       openEditServer: function (srv) {
@@ -781,10 +774,8 @@
           ])
         ]),
         row("启用透明代理 (Enable Transparent Proxy)", "总开关：启用后自动配置 dnsmasq 与 nftables 将局域网设备流量按规则转入 Xray", flagSwitch(self.gen, "transparent_proxy_enable")),
-        row("TCP 节点池 (IPv4, 已选 " + self.tcpNodesV4.length + " 个)", "可选 1 个主节点，或同时添加多个节点开启 Xray 原生负载均衡 / 自动故障切换", multiNodeSelector("tcpNodesV4")),
-        row("UDP 节点池 (IPv4, 已选 " + self.udpNodesV4.length + " 个)", "负责联机游戏、语音通话、QUIC (HTTP/3) 等 UDP 流量（支持多选）", multiNodeSelector("udpNodesV4")),
-        row("TCP 节点池 (IPv6, 已选 " + self.tcpNodesV6.length + " 个)", "如需代理 IPv6 TCP 流量可添加节点（默认留空可防 IPv6 分流异常）", multiNodeSelector("tcpNodesV6")),
-        row("UDP 节点池 (IPv6, 已选 " + self.udpNodesV6.length + " 个)", "如需代理 IPv6 UDP 流量可添加节点", multiNodeSelector("udpNodesV6")),
+        row("IPv4 TCP/UDP 节点池 (已选 " + self.tcpNodesV4.length + " 个)", "同时作用于 IPv4 的 TCP 与 UDP 流量（可选 1 个主节点，或添加多个节点开启负载均衡 / 自动故障切换）", multiNodeSelector("tcpNodesV4")),
+        row("IPv6 TCP/UDP 节点池 (已选 " + self.tcpNodesV6.length + " 个)", "同时作用于 IPv6 的 TCP 与 UDP 流量（默认留空可防 IPv6 分流异常）", multiNodeSelector("tcpNodesV6")),
         row("多节点负载均衡策略 (Balancer Strategy)", "当上方节点池添加 ≥2 个节点时生效：leastPing 会自动探测并优先走延迟最低的存活节点（需开启 Observatory）", selectInput(self.gen, "general_balancer_strategy", [
           ["random", "random (随机均摊流量)"],
           ["leastPing", "leastPing (最低延迟优先 + 自动故障切换)"],
@@ -845,16 +836,13 @@
             ]),
             h("tbody", filteredServers.map(function (srv) {
               var id = srv[".name"];
-              var inTcp = self.tcpNodesV4.indexOf(id) >= 0;
-              var inUdp = self.udpNodesV4.indexOf(id) >= 0;
-              var isCurrent = inTcp || inUdp;
+              var isCurrent = self.tcpNodesV4.indexOf(id) >= 0;
               var p = srv.protocol || "";
               var tls = srv[p + "_tls"] || "none";
               return h("tr", { key: id, class: isCurrent ? "active-row" : "" }, [
                 h("td", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, [
                   h("strong", srv.alias || "-"),
-                  inTcp ? h("span", { class: "xgl-badge ok", style: { marginLeft: "6px", padding: "2px 7px" } }, "TCP") : null,
-                  inUdp ? h("span", { class: "xgl-badge info", style: { marginLeft: "4px", padding: "2px 7px" } }, "UDP") : null
+                  isCurrent ? h("span", { class: "xgl-badge ok", style: { marginLeft: "6px", padding: "2px 7px" } }, "已启用") : null
                 ]),
                 h("td", { style: { whiteSpace: "nowrap", fontSize: "12px" } }, p === "shadowsocks" ? "SS" : p.toUpperCase()),
                 h("td", { style: { whiteSpace: "nowrap", fontSize: "12px" } }, (srv.transport || "tcp").toUpperCase() + (tls !== "none" ? "+" + tls.toUpperCase() : "")),
