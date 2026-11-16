@@ -1547,10 +1547,9 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
       // Navigation tabs
       var tabs = [
         ["status", "1. 基本设置与节点订阅 (" + self.servers.length + ")"],
-        ["dns", "2. DNS 与 FakeDNS"],
-        ["routing", "3. 出站规则与流量嗅探"],
-        ["advanced", "4. 高级参数与监控"],
-        ["preview", "5. 配置预览与日志"]
+        ["dns", "2. DNS 与分流规则"],
+        ["advanced", "3. 高级参数与监控"],
+        ["preview", "4. 配置预览与日志"]
       ];
       var tabBar = h("div", { class: "xgl-tabs" }, tabs.map(function (t) {
         return h("div", {
@@ -1688,7 +1687,10 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         ])
       ]);
 
-      // Tab 2: DNS & FakeDNS
+      // Tab 2: DNS, Outbound Routing, Sniffing, LAN Hosts & Extra Inbounds
+      var lanList = self.subsections.lan_hosts || [];
+      var extraInbounds = self.subsections.extra_inbound || [];
+
       var tabDns = h("div", [
         h("div", { class: "xgl-section-title" }, [
           h("span", "分流 DNS 与去广告域名规则"),
@@ -1720,19 +1722,9 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           ["global", "global (全局集成)"],
           ["per_instance", "per_instance (按实例集成)"]
         ])),
-        h("div", { class: "xgl-section-title" }, "FakeDNS 虚拟地址池配置"),
-        row("FakeDNS IPv4 地址池 (Pool v4)", "默认 198.18.0.0/15", textInput(self.gen, "pool_v4", "198.18.0.0/15")),
-        row("FakeDNS IPv4 容量 (Pool v4 Size)", "默认 65535", textInput(self.gen, "pool_v4_size", "65535")),
-        row("FakeDNS IPv6 地址池 (Pool v6)", "默认 2001:2::/48", textInput(self.gen, "pool_v6", "2001:2::/48")),
-        row("FakeDNS IPv6 容量 (Pool v6 Size)", "默认 65535", textInput(self.gen, "pool_v6_size", "65535"))
-      ]);
 
-      // Tab 3: Outbound Routing, Sniffing, LAN Hosts & Extra Inbounds (Merged)
-      var lanList = self.subsections.lan_hosts || [];
-      var extraInbounds = self.subsections.extra_inbound || [];
-
-      var tabRouting = h("div", [
-        h("div", { class: "xgl-section-title" }, "GeoIP 国家代码与 IP/端口分流规则"),
+        // Merged Outbound Routing, Sniffing, LAN Hosts & Extra Inbounds
+        h("div", { class: "xgl-section-title", style: { marginTop: "24px" } }, "GeoIP 国家代码与 IP/端口出站分流规则"),
         row("GeoIP 直连代码列表 (IPv4)", "每行一个代码，如 cn（中国大陆 IP 直连）或 telegram；留空则全部非私网 IP 走代理", h("textarea", {
           class: "xgl-textarea",
           domProps: { value: self.geoipDirectV4Text },
@@ -2038,7 +2030,6 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
 
       var activeView = tabStatus;
       if (self.activeTab === "dns") activeView = tabDns;
-      else if (self.activeTab === "routing") activeView = tabRouting;
       else if (self.activeTab === "advanced") activeView = tabAdvanced;
       else if (self.activeTab === "preview") activeView = tabPreview;
 
