@@ -91,6 +91,12 @@
     return v || "";
   }
 
+  function asArray(v) {
+    if (Array.isArray(v)) return v.slice();
+    if (typeof v === "string" && v !== "") return [v];
+    return [];
+  }
+
   var XrayApp = {
     name: "GlSdk4UiXray",
     data: function () {
@@ -120,11 +126,11 @@
         },
         lan_clients: [],
 
-        // Convenience bindings for general
-        tcpNodeV4: "",
-        udpNodeV4: "",
-        tcpNodeV6: "",
-        udpNodeV6: "",
+        // Multi-node balancer arrays for general
+        tcpNodesV4: [],
+        udpNodesV4: [],
+        tcpNodesV6: [],
+        udpNodesV6: [],
         bypassedRulesText: "",
         forwardedRulesText: "",
         blockedRulesText: "",
@@ -223,10 +229,10 @@
             custom_configuration_hook: g.custom_configuration_hook || ""
           };
 
-          self.tcpNodeV4 = firstItem(g.tcp_balancer_v4);
-          self.udpNodeV4 = firstItem(g.udp_balancer_v4);
-          self.tcpNodeV6 = firstItem(g.tcp_balancer_v6);
-          self.udpNodeV6 = firstItem(g.udp_balancer_v6);
+          self.tcpNodesV4 = asArray(g.tcp_balancer_v4);
+          self.udpNodesV4 = asArray(g.udp_balancer_v4);
+          self.tcpNodesV6 = asArray(g.tcp_balancer_v6);
+          self.udpNodesV6 = asArray(g.udp_balancer_v6);
 
           self.bypassedRulesText = arrToLines(g.bypassed_domain_rules);
           self.forwardedRulesText = arrToLines(g.forwarded_domain_rules);
@@ -256,10 +262,10 @@
         var self = this;
         self.saving = true;
         var payload = Object.assign({}, self.gen, {
-          tcp_balancer_v4: self.tcpNodeV4 ? [self.tcpNodeV4] : [],
-          udp_balancer_v4: self.udpNodeV4 ? [self.udpNodeV4] : [],
-          tcp_balancer_v6: self.tcpNodeV6 ? [self.tcpNodeV6] : [],
-          udp_balancer_v6: self.udpNodeV6 ? [self.udpNodeV6] : [],
+          tcp_balancer_v4: self.tcpNodesV4,
+          udp_balancer_v4: self.udpNodesV4,
+          tcp_balancer_v6: self.tcpNodesV6,
+          udp_balancer_v6: self.udpNodesV6,
           bypassed_domain_rules: linesToArr(self.bypassedRulesText),
           forwarded_domain_rules: linesToArr(self.forwardedRulesText),
           blocked_domain_rules: linesToArr(self.blockedRulesText),
@@ -306,15 +312,15 @@
 
       quickUseServer: function (srvId) {
         var self = this;
-        self.tcpNodeV4 = srvId;
-        self.udpNodeV4 = srvId;
+        self.tcpNodesV4 = [srvId];
+        self.udpNodesV4 = [srvId];
         self.saving = true;
         callRpc("switch_node", {
           enabled: true,
-          tcp_node: srvId,
-          udp_node: srvId
+          tcp_nodes: [srvId],
+          udp_nodes: [srvId]
         }).then(function () {
-          self.showToast("已切换主节点并重启 Xray！");
+          self.showToast("已切换为唯一主节点并重启 Xray！");
           setTimeout(function () {
             self.loadAll();
             self.saving = false;
@@ -323,6 +329,17 @@
           self.showToast("切换失败: " + e.message);
           self.saving = false;
         });
+      },
+
+      togglePoolNode: function (poolKey, srvId) {
+        var arr = this[poolKey].slice();
+        var idx = arr.indexOf(srvId);
+        if (idx >= 0) {
+          arr.splice(idx, 1);
+        } else {
+          arr.push(srvId);
+        }
+        this[poolKey] = arr;
       },
 
       openEditServer: function (srv) {
@@ -637,13 +654,53 @@
         }));
       }
 
-      function serverOptions(includeEmpty) {
-        var list = [];
-        if (includeEmpty) list.push(h("option", { domProps: { value: "" } }, "-- 不启用 / 未选择 --"));
-        self.servers.forEach(function (s) {
-          list.push(h("option", { domProps: { value: s[".name"] } }, (s.alias || s.server) + " [" + (s.protocol || "").toUpperCase() + "]"));
-        });
-        return list;
+      function serverAliasById(id) {
+        var found = self.servers.find(function (s) { return s[".name"] === id; });
+        return found ? (found.alias || found.server || id) : id;
+      }
+
+      function multiNodeSelector(poolKey) {
+        var selected = self[poolKey] || [];
+        return h("div", { style: { width: "100%", display: "flex", flexDirection: "column", gap: "8px" } }, [
+          h("div", { style: { display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center" } },
+            selected.length > 0 ? selected.map(function (id) {
+              return h("span", {
+                key: id,
+                class: "xgl-badge ok",
+                style: { cursor: "pointer", userSelect: "none" },
+                attrs: { title: "点击从池中移除该节点" },
+                on: { click: function () { self.togglePoolNode(poolKey, id); } }
+              }, serverAliasById(id) + " ✕");
+            }).concat([
+              h("button", {
+                class: "xgl-btn sm",
+                style: { padding: "2px 8px", fontSize: "11px" },
+                on: { click: function () { self[poolKey] = []; } }
+              }, "清空")
+            ]) : [
+              h("span", { class: "xgl-desc" }, "未选择节点（当前方向不启用代理）")
+            ]
+          ),
+          h("select", {
+            class: "xgl-select",
+            domProps: { value: "" },
+            on: {
+              change: function (e) {
+                var val = e.target.value;
+                if (val && self[poolKey].indexOf(val) < 0) {
+                  self[poolKey] = self[poolKey].concat([val]);
+                }
+                e.target.value = "";
+              }
+            }
+          }, [
+            h("option", { domProps: { value: "" } }, "+ 点击添加节点到此池 (可选多个组成负载均衡)...")
+          ].concat(self.servers.map(function (s) {
+            var id = s[".name"];
+            var inPool = self[poolKey].indexOf(id) >= 0;
+            return h("option", { domProps: { value: id, disabled: inPool } }, (inPool ? "✓ " : "") + (s.alias || s.server) + " [" + (s.protocol || "").toUpperCase() + "]");
+          })))
+        ]);
       }
 
       // Top status bar
@@ -696,37 +753,21 @@
       // Tab 1: General Settings + Routing Mode + Servers & Subscriptions (Merged)
       var tabStatus = h("div", [
         h("div", { class: "xgl-section-title" }, [
-          h("span", "核心透明代理开关、主用节点与分流模式"),
+          h("span", "核心透明代理开关、多节点负载均衡池与分流模式"),
           h("div", { class: "xgl-status-group" }, [
             h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("bypass_cn"); } } }, "一键预设：绕过中国大陆"),
             h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("global"); } } }, "一键预设：全局代理")
           ])
         ]),
         row("启用透明代理 (Enable Transparent Proxy)", "总开关：启用后自动配置 dnsmasq 与 nftables 将局域网设备流量按规则转入 Xray", flagSwitch(self.gen, "transparent_proxy_enable")),
-        row("TCP 主节点 (IPv4)", "负责网页、视频、常规 HTTPS 等全部 TCP 流量", h("select", {
-          class: "xgl-select",
-          domProps: { value: self.tcpNodeV4 },
-          on: { change: function (e) { self.tcpNodeV4 = e.target.value; } }
-        }, serverOptions(true))),
-        row("UDP 节点 (IPv4)", "负责联机游戏、语音通话、QUIC (HTTP/3) 等 UDP 流量", h("select", {
-          class: "xgl-select",
-          domProps: { value: self.udpNodeV4 },
-          on: { change: function (e) { self.udpNodeV4 = e.target.value; } }
-        }, serverOptions(true))),
-        row("TCP 节点 (IPv6)", "如需代理 IPv6 TCP 流量可选择节点（默认留空可防 IPv6 分流异常）", h("select", {
-          class: "xgl-select",
-          domProps: { value: self.tcpNodeV6 },
-          on: { change: function (e) { self.tcpNodeV6 = e.target.value; } }
-        }, serverOptions(true))),
-        row("UDP 节点 (IPv6)", "如需代理 IPv6 UDP 流量可选择节点", h("select", {
-          class: "xgl-select",
-          domProps: { value: self.udpNodeV6 },
-          on: { change: function (e) { self.udpNodeV6 = e.target.value; } }
-        }, serverOptions(true))),
-        row("负载均衡策略 (Balancer Strategy)", "当选择多个节点时的分配策略（leastPing 需在高级参数中开启 Observatory）", selectInput(self.gen, "general_balancer_strategy", [
-          ["random", "random (随机分配)"],
-          ["leastPing", "leastPing (最低延迟优先)"],
-          ["roundRobin", "roundRobin (按序轮询)"]
+        row("TCP 节点池 (IPv4, 已选 " + self.tcpNodesV4.length + " 个)", "可选 1 个主节点，或同时添加多个节点开启 Xray 原生负载均衡 / 自动故障切换", multiNodeSelector("tcpNodesV4")),
+        row("UDP 节点池 (IPv4, 已选 " + self.udpNodesV4.length + " 个)", "负责联机游戏、语音通话、QUIC (HTTP/3) 等 UDP 流量（支持多选）", multiNodeSelector("udpNodesV4")),
+        row("TCP 节点池 (IPv6, 已选 " + self.tcpNodesV6.length + " 个)", "如需代理 IPv6 TCP 流量可添加节点（默认留空可防 IPv6 分流异常）", multiNodeSelector("tcpNodesV6")),
+        row("UDP 节点池 (IPv6, 已选 " + self.udpNodesV6.length + " 个)", "如需代理 IPv6 UDP 流量可添加节点", multiNodeSelector("udpNodesV6")),
+        row("多节点负载均衡策略 (Balancer Strategy)", "当上方节点池添加 ≥2 个节点时生效：leastPing 会自动探测并优先走延迟最低的存活节点（需开启 Observatory）", selectInput(self.gen, "general_balancer_strategy", [
+          ["random", "random (随机均摊流量)"],
+          ["leastPing", "leastPing (最低延迟优先 + 自动故障切换)"],
+          ["roundRobin", "roundRobin (按序轮询分配)"]
         ])),
 
         // Node management & Subscription section placed right below routing/general settings
@@ -779,32 +820,48 @@
                 h("th", "协议"),
                 h("th", "传输 / 安全"),
                 h("th", "服务器地址 : 端口"),
-                h("th", { style: { textAlign: "right" } }, "操作")
+                h("th", { style: { textAlign: "right" } }, "快捷单选 / 负载池多选 / 操作")
               ])
             ]),
             h("tbody", filteredServers.map(function (srv) {
               var id = srv[".name"];
-              var isCurrent = (self.tcpNodeV4 === id);
+              var inTcp = self.tcpNodesV4.indexOf(id) >= 0;
+              var inUdp = self.udpNodesV4.indexOf(id) >= 0;
+              var isCurrent = inTcp || inUdp;
               var p = srv.protocol || "";
               var tls = srv[p + "_tls"] || "none";
               return h("tr", { key: id, class: isCurrent ? "active-row" : "" }, [
                 h("td", id),
                 h("td", [
                   h("strong", srv.alias || "-"),
-                  isCurrent ? h("span", { class: "xgl-badge ok", style: { marginLeft: "8px" } }, "当前主用") : null
+                  inTcp ? h("span", { class: "xgl-badge ok", style: { marginLeft: "6px" } }, "TCP") : null,
+                  inUdp ? h("span", { class: "xgl-badge info", style: { marginLeft: "4px" } }, "UDP") : null
                 ]),
                 h("td", p.toUpperCase()),
                 h("td", (srv.transport || "tcp").toUpperCase() + (tls !== "none" ? " + " + tls.toUpperCase() : "")),
                 h("td", (srv.server || "") + ":" + firstItem(srv.server_port)),
                 h("td", { style: { textAlign: "right", whiteSpace: "nowrap" } }, [
-                  !isCurrent ? h("button", {
+                  h("button", {
                     class: "xgl-btn sm success",
-                    style: { marginRight: "6px" },
+                    style: { marginRight: "5px" },
+                    attrs: { title: "将该节点设为唯一的 TCP+UDP 主节点并立即重启生效" },
                     on: { click: function () { self.quickUseServer(id); } }
-                  }, "启用") : null,
+                  }, "单选启用"),
+                  h("button", {
+                    class: "xgl-btn sm " + (inTcp ? "primary" : ""),
+                    style: { marginRight: "5px" },
+                    attrs: { title: "加入或移出上方 TCP (IPv4) 负载均衡池" },
+                    on: { click: function () { self.togglePoolNode("tcpNodesV4", id); } }
+                  }, inTcp ? "✓ TCP池" : "+TCP池"),
+                  h("button", {
+                    class: "xgl-btn sm " + (inUdp ? "primary" : ""),
+                    style: { marginRight: "5px" },
+                    attrs: { title: "加入或移出上方 UDP (IPv4) 负载均衡池" },
+                    on: { click: function () { self.togglePoolNode("udpNodesV4", id); } }
+                  }, inUdp ? "✓ UDP池" : "+UDP池"),
                   h("button", {
                     class: "xgl-btn sm",
-                    style: { marginRight: "6px" },
+                    style: { marginRight: "5px" },
                     on: { click: function () { self.openEditServer(srv); } }
                   }, "编辑"),
                   h("button", {
