@@ -15,9 +15,27 @@ RPC_FILE="/usr/lib/oui-httpd/rpc/xray"
 VIEW_JS="/www/views/gl-sdk4-ui-xray.common.js"
 VIEW_GZ="/www/views/gl-sdk4-ui-xray.common.js.gz"
 
+LUCI_XRAY_URL="https://github.com/dazhn/luci-app-xray/releases/download/v3.7.2/luci-app-xray_3.7.2-r1_all.apk"
+LUCI_XRAY_STATUS_URL="https://github.com/dazhn/luci-app-xray/releases/download/v3.7.2/luci-app-xray-status_3.7.2-r1_all.apk"
+
 say() { printf "\033[1;32m[gl-sdk4-ui-xray]\033[0m %s\n" "$*"; }
 warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31m[ERROR]\033[0m %s\n" "$*" >&2; exit 1; }
+
+download_with_fallback() {
+    local url="$1"
+    local dest="$2"
+    if curl -fsSL --connect-timeout 8 -m 60 -o "$dest" "$url" 2>/dev/null; then
+        return 0
+    fi
+    warn "GitHub 直连较慢，尝试通过镜像加速下载..."
+    for proxy in "https://ghfast.top/" "https://gh-proxy.com/"; do
+        if curl -fsSL --connect-timeout 8 -m 60 -o "$dest" "${proxy}${url}" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 [ "$(id -u)" = "0" ] || die "请使用 root 权限运行此脚本 (Please run as root)"
 
@@ -38,20 +56,50 @@ fi
 [ -d /usr/share/oui/menu.d ] && [ -d /usr/lib/oui-httpd/rpc ] && [ -d /www/views ] || \
     die "未检测到 GL.iNet SDK4 (oui-httpd) 目录结构，请确认当前设备为 GL.iNet 官方固件。"
 
-# Check if xray-core and luci-app-xray backend exist; auto-install if missing on OpenWrt 25.12 apk
-if [ ! -f /etc/init.d/xray_core ] || ! command -v xray >/dev/null 2>&1; then
-    warn "检测到系统尚未安装 xray-core 或 luci-app-xray 后端组件。"
+# 1. Auto-install xray-core and luci-app-xray if missing
+if ! command -v xray >/dev/null 2>&1 || [ ! -f /etc/init.d/xray_core ]; then
+    say "检测到系统尚未完整安装 xray-core 或 luci-app-xray，开始自动部署依赖..."
     if command -v apk >/dev/null 2>&1; then
-        say "检测到 OpenWrt 25.12 (apk)，尝试自动安装 xray-core 与 luci-app-xray..."
-        apk update >/dev/null 2>&1 || true
-        apk add xray-core >/dev/null 2>&1 || true
+        apk update || true
+        if ! command -v xray >/dev/null 2>&1; then
+            say "正在从官方软件源安装 xray-core..."
+            apk add xray-core
+        fi
         if [ ! -f /etc/init.d/xray_core ]; then
-            TMP_APK="/tmp/luci-app-xray.apk"
-            if curl -fsSL --connect-timeout 10 -o "$TMP_APK" "https://github.com/dazhn/luci-app-xray/releases/download/v3.7.2/luci-app-xray_3.7.2-r1_all.apk"; then
-                apk add --allow-untrusted "$TMP_APK" || true
-                rm -f "$TMP_APK"
+            say "正在下载并安装 luci-app-xray (OpenWrt 25.12 APK)..."
+            TMP_APK1="/tmp/luci-app-xray.apk"
+            TMP_APK2="/tmp/luci-app-xray-status.apk"
+            if download_with_fallback "$LUCI_XRAY_URL" "$TMP_APK1"; then
+                if download_with_fallback "$LUCI_XRAY_STATUS_URL" "$TMP_APK2"; then
+                    apk add --allow-untrusted "$TMP_APK1" "$TMP_APK2"
+                else
+                    apk add --allow-untrusted "$TMP_APK1"
+                fi
+                rm -f "$TMP_APK1" "$TMP_APK2"
+            else
+                die "下载 luci-app-xray.apk 失败，请检查网络连接！"
             fi
         fi
+    elif command -v opkg >/dev/null 2>&1; then
+        opkg update || true
+        command -v xray >/dev/null 2>&1 || opkg install xray-core
+    fi
+else
+    say "检测到 xray-core 与 luci-app-xray 已安装，直接部署原生面板。"
+fi
+
+# 2. Ensure geoip.dat and geosite.dat exist under /usr/share/xray
+mkdir -p /usr/share/xray
+if [ ! -s /usr/share/xray/geoip.dat ] || [ ! -s /usr/share/xray/geosite.dat ]; then
+    say "检测到 /usr/share/xray 缺少 geoip.dat 或 geosite.dat，正在自动安装规则库..."
+    if command -v apk >/dev/null 2>&1; then
+        apk add v2ray-geoip v2ray-geosite >/dev/null 2>&1 || true
+    fi
+    if [ ! -s /usr/share/xray/geoip.dat ]; then
+        download_with_fallback "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" "/usr/share/xray/geoip.dat" || true
+    fi
+    if [ ! -s /usr/share/xray/geosite.dat ]; then
+        download_with_fallback "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" "/usr/share/xray/geosite.dat" || true
     fi
 fi
 
