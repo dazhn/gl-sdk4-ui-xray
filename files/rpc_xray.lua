@@ -376,9 +376,9 @@ function M.get_all()
 
     local geoip_ok, geoip_sz = file_size_mb("/usr/share/xray/geoip.dat")
     local geosite_ok, geosite_sz = file_size_mb("/usr/share/xray/geosite.dat")
-    local geo_status = trim(read_file("/tmp/xray_geo_update.status") or "")
+    local geo_status = fs.access("/tmp/xray_geo_update.status") and trim(read_file("/tmp/xray_geo_update.status") or "") or ""
     local running, proc_alive, tproxy_active = get_xray_status(gen)
-    local metrics = proc_alive and fetch_metrics_summary(gen.metrics_server_port) or nil
+    local metrics = (proc_alive and gen.metrics_server_enable == "1") and fetch_metrics_summary(gen.metrics_server_port) or nil
 
     return {
         code = 0,
@@ -405,22 +405,28 @@ function M.get_metrics()
     local c = uci.cursor()
     local _, gen = get_general_section(c)
     local running, proc_alive, tproxy_active = get_xray_status(gen)
-    local geoip_ok, geoip_sz = file_size_mb("/usr/share/xray/geoip.dat")
-    local geosite_ok, geosite_sz = file_size_mb("/usr/share/xray/geosite.dat")
-    local geo_status = trim(read_file("/tmp/xray_geo_update.status") or "")
+    local out = {
+        running = running,
+        proc_running = proc_alive,
+        tproxy_enabled = tproxy_active,
+        metrics = (proc_alive and gen and gen.metrics_server_enable == "1") and fetch_metrics_summary(gen.metrics_server_port) or nil
+    }
+    if fs.access("/tmp/xray_geo_update.status") then
+        local geo_status = trim(read_file("/tmp/xray_geo_update.status") or "")
+        out.geo_status = geo_status
+        if geo_status == "ok" or geo_status == "err" then
+            os.remove("/tmp/xray_geo_update.status")
+            local geoip_ok, geoip_sz = file_size_mb("/usr/share/xray/geoip.dat")
+            local geosite_ok, geosite_sz = file_size_mb("/usr/share/xray/geosite.dat")
+            out.geoip_ok = geoip_ok
+            out.geoip_size = geoip_sz
+            out.geosite_ok = geosite_ok
+            out.geosite_size = geosite_sz
+        end
+    end
     return {
         code = 0,
-        data = {
-            running = running,
-            proc_running = proc_alive,
-            tproxy_enabled = tproxy_active,
-            geoip_ok = geoip_ok,
-            geoip_size = geoip_sz,
-            geosite_ok = geosite_ok,
-            geosite_size = geosite_sz,
-            geo_status = geo_status,
-            metrics = proc_alive and fetch_metrics_summary(gen and gen.metrics_server_port) or nil
-        }
+        data = out
     }
 end
 
@@ -437,48 +443,6 @@ function M.save_general(args)
     if args.apply ~= false then
         service_exec("restart")
     end
-    return { code = 0, data = { ok = true } }
-end
-
-local function filter_valid_servers(c, list)
-    local out = {}
-    if type(list) == "string" then list = { list } end
-    if type(list) ~= "table" then return out end
-    for _, id in ipairs(list) do
-        if type(id) == "string" and id ~= "" and c:get("xray_core", id) == "servers" then
-            out[#out + 1] = id
-        end
-    end
-    return out
-end
-
--- 3. Quick switch active TCP/UDP node
-function M.switch_node(args)
-    if type(args) ~= "table" then
-        return { code = -1, error = "参数错误" }
-    end
-    local c = uci.cursor()
-    local gen_id = get_general_section(c)
-
-    if args.enabled ~= nil then
-        c:set("xray_core", gen_id, "transparent_proxy_enable", args.enabled and "1" or "0")
-    end
-    local tcp_list = filter_valid_servers(c, args.tcp_nodes or args.tcp_node)
-    if (args.tcp_nodes or args.tcp_node) and #tcp_list == 0 then
-        return { code = -1, error = "指定的 TCP 节点不存在" }
-    elseif #tcp_list > 0 then
-        c:set("xray_core", gen_id, "tcp_balancer_v4", tcp_list)
-    end
-
-    local udp_list = filter_valid_servers(c, args.udp_nodes or args.udp_node)
-    if (args.udp_nodes or args.udp_node) and #udp_list == 0 then
-        return { code = -1, error = "指定的 UDP 节点不存在" }
-    elseif #udp_list > 0 then
-        c:set("xray_core", gen_id, "udp_balancer_v4", udp_list)
-    end
-
-    c:commit("xray_core")
-    service_exec("restart")
     return { code = 0, data = { ok = true } }
 end
 

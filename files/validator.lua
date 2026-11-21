@@ -5,7 +5,6 @@ return {
     save_general = true,
     save_server = true,
     delete_server = true,
-    switch_node = true,
     import_links = true,
     save_subsection = true,
     delete_subsection = true,

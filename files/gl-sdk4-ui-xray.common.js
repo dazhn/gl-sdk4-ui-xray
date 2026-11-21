@@ -528,27 +528,10 @@
       },
 
       quickUseServer: function (srvId) {
-        var self = this;
-        self.tcpNodesV4 = [srvId];
-        self.udpNodesV4 = [srvId];
-        self.$set(self.gen, "transparent_proxy_enable", "1");
-        if (self.isDirty) {
-          self.saveAllGeneral();
-          return;
-        }
-        self.saving = true;
-        callRpc("switch_node", {
-          enabled: true,
-          tcp_nodes: [srvId],
-          udp_nodes: [srvId]
-        }, 35000).then(function () {
-          self.showToast("已切换为主节点并完成重启！");
-          return self.loadAll();
-        }).catch(function (e) {
-          self.showToast("切换失败: " + e.message);
-        }).finally(function () {
-          self.saving = false;
-        });
+        this.tcpNodesV4 = [srvId];
+        this.udpNodesV4 = [srvId];
+        this.$set(this.gen, "transparent_proxy_enable", "1");
+        return this.saveAllGeneral();
       },
 
       addFilteredToV4Pool: function (list) {
@@ -602,7 +585,6 @@
             server: "",
             port: "443",
             password: "",
-            username: "",
             domain_strategy: "UseIP",
             dialer_proxy: "disabled",
             protocol: "vless",
@@ -622,7 +604,6 @@
             reality_spider_x: "",
             reality_fingerprint: "chrome",
             transport: "tcp",
-            tcp_guise: "none",
             ws_host: "",
             ws_path: "/",
             grpc_service_name: "",
@@ -645,14 +626,13 @@
           server: srv.server || "",
           port: firstItem(srv.server_port) || "443",
           password: srv.password || "",
-          username: srv.username || "",
           domain_strategy: srv.domain_strategy || "UseIP",
           dialer_proxy: srv.dialer_proxy || "disabled",
           protocol: p,
           shadowsocks_security: srv.shadowsocks_security || "aes-256-gcm",
           shadowsocks_udp_over_tcp: srv.shadowsocks_udp_over_tcp || "0",
           vmess_security: srv.vmess_security || "auto",
-          vmess_alter_id: srv.vmess_alter_id || srv.alter_id || "0",
+          vmess_alter_id: srv.alter_id || srv.vmess_alter_id || "0",
           vless_encryption: srv.vless_encryption || "none",
           tls_mode: tlsMode,
           flow_mode: (tlsMode === "reality" ? srv.vless_flow_reality : srv.vless_flow_tls) || "none",
@@ -665,7 +645,6 @@
           reality_spider_x: srv.vless_reality_spider_x || srv.vless_spider_x || "",
           reality_fingerprint: srv.vless_reality_fingerprint || "chrome",
           transport: srv.transport || (p === "hysteria" ? "hysteria" : "tcp"),
-          tcp_guise: srv.tcp_guise || "none",
           ws_host: srv.ws_host || "",
           ws_path: srv.ws_path || "/",
           grpc_service_name: srv.grpc_service_name || "",
@@ -696,45 +675,43 @@
           server: ed.server,
           server_port: [String(ed.port)],
           password: ed.password,
-          username: ed.username,
           domain_strategy: ed.domain_strategy,
           dialer_proxy: ed.dialer_proxy,
           protocol: p,
-          transport: ed.transport
+          transport: ed.transport,
+          shadowsocks_security: p === "shadowsocks" ? ed.shadowsocks_security : "",
+          shadowsocks_udp_over_tcp: p === "shadowsocks" ? ed.shadowsocks_udp_over_tcp : "",
+          vmess_security: p === "vmess" ? ed.vmess_security : "",
+          alter_id: p === "vmess" ? ed.vmess_alter_id : "",
+          vless_encryption: p === "vless" ? (ed.vless_encryption || "none") : "",
+          vless_flow_tls: (p === "vless" && ed.tls_mode === "tls") ? ed.flow_mode : "",
+          vless_flow_reality: (p === "vless" && ed.tls_mode === "reality") ? ed.flow_mode : "",
+          vless_reality_server_name: (p === "vless" && ed.tls_mode === "reality") ? ed.reality_server_name : "",
+          vless_reality_public_key: (p === "vless" && ed.tls_mode === "reality") ? ed.reality_public_key : "",
+          vless_reality_short_id: (p === "vless" && ed.tls_mode === "reality") ? ed.reality_short_id : "",
+          vless_reality_spider_x: (p === "vless" && ed.tls_mode === "reality") ? ed.reality_spider_x : "",
+          vless_reality_fingerprint: (p === "vless" && ed.tls_mode === "reality") ? ed.reality_fingerprint : "",
+          ws_host: ed.transport === "ws" ? ed.ws_host : "",
+          ws_path: ed.transport === "ws" ? ed.ws_path : "",
+          grpc_service_name: ed.transport === "grpc" ? ed.grpc_service_name : "",
+          splithttp_host: ed.transport === "splithttp" ? ed.splithttp_host : "",
+          splithttp_path: ed.transport === "splithttp" ? ed.splithttp_path : "",
+          httpupgrade_host: ed.transport === "httpupgrade" ? ed.httpupgrade_host : "",
+          httpupgrade_path: ed.transport === "httpupgrade" ? ed.httpupgrade_path : "",
+          hysteria_up_mbps: (ed.transport === "hysteria" || p === "hysteria") ? ed.hysteria_up : "",
+          hysteria_down_mbps: (ed.transport === "hysteria" || p === "hysteria") ? ed.hysteria_down : "",
+          hysteria_udphop_port: (ed.transport === "hysteria" || p === "hysteria") ? ed.hysteria_udphop_port : ""
         };
+        if (!ed.id && ed.transport === "tcp") vals.tcp_guise = "none";
         vals[p + "_tls"] = ed.tls_mode;
-        if (p === "shadowsocks") {
-          vals.shadowsocks_security = ed.shadowsocks_security;
-          vals.shadowsocks_udp_over_tcp = ed.shadowsocks_udp_over_tcp;
-        } else if (p === "vmess") {
-          vals.vmess_security = ed.vmess_security;
-          vals.alter_id = ed.vmess_alter_id;
-        } else if (p === "vless") {
-          vals.vless_encryption = ed.vless_encryption || "none";
-          if (ed.tls_mode === "tls") vals.vless_flow_tls = ed.flow_mode;
-          if (ed.tls_mode === "reality") {
-            vals.vless_flow_reality = ed.flow_mode;
-            vals.vless_reality_server_name = ed.reality_server_name;
-            vals.vless_reality_public_key = ed.reality_public_key;
-            vals.vless_reality_short_id = ed.reality_short_id;
-            vals.vless_reality_spider_x = ed.reality_spider_x;
-            vals.vless_reality_fingerprint = ed.reality_fingerprint;
-          }
-        }
         if (ed.tls_mode === "tls") {
           vals[p + "_tls_host"] = ed.tls_host;
           vals[p + "_tls_insecure"] = ed.tls_insecure || "0";
           vals[p + "_tls_fingerprint"] = ed.tls_fingerprint || "chrome";
-        }
-        if (ed.transport === "tcp") vals.tcp_guise = ed.tcp_guise;
-        if (ed.transport === "ws") { vals.ws_host = ed.ws_host; vals.ws_path = ed.ws_path; }
-        if (ed.transport === "grpc") vals.grpc_service_name = ed.grpc_service_name;
-        if (ed.transport === "splithttp") { vals.splithttp_host = ed.splithttp_host; vals.splithttp_path = ed.splithttp_path; }
-        if (ed.transport === "httpupgrade") { vals.httpupgrade_host = ed.httpupgrade_host; vals.httpupgrade_path = ed.httpupgrade_path; }
-        if (ed.transport === "hysteria" || p === "hysteria") {
-          vals.hysteria_up_mbps = ed.hysteria_up;
-          vals.hysteria_down_mbps = ed.hysteria_down;
-          vals.hysteria_udphop_port = ed.hysteria_udphop_port;
+        } else {
+          vals[p + "_tls_host"] = "";
+          vals[p + "_tls_insecure"] = "";
+          vals[p + "_tls_fingerprint"] = "";
         }
 
         self.savingServer = true;
@@ -1279,7 +1256,9 @@
 
         h("div", { class: "xgl-section-title", style: { marginTop: "24px" } }, "流量域名嗅探 (Traffic Sniffing)"),
         row("启用流量嗅探 (Enable Sniffing)", "从 TLS SNI / HTTP Host 中还原真实访问域名用于精准路由分流（强烈建议开启）", flagSwitch(self.gen, "tproxy_sniffing")),
-        row("仅用于路由分流 (Route Only)", "开启后嗅探出的域名仅用于匹配分流规则，连接时仍使用已解析的 IP，避免二次 DNS 解析开销", flagSwitch(self.gen, "route_only")),
+        self.gen.tproxy_sniffing === "1"
+          ? row("仅用于路由分流 (Route Only)", "开启后嗅探出的域名仅用于匹配分流规则，连接时仍使用已解析的 IP，避免二次 DNS 解析开销", flagSwitch(self.gen, "route_only"))
+          : null,
         row("BT 下载流量强制直连 (Bittorrent Direct)", "开启后识别到 BitTorrent 协议流量直接走本地宽带直连，防止触发机场审计封号", flagSwitch(self.gen, "direct_bittorrent")),
         row("路由域名解析策略 (Routing Domain Strategy)", "匹配路由规则时的 IP 解析策略", selectInput(self.gen, "routing_domain_strategy", [
           ["AsIs", "AsIs (仅按域名匹配，最快)"],
@@ -1446,8 +1425,10 @@
         row("启用 DNS 日志 (DNS Log)", "将每次 DNS 查询记录写入系统日志", flagSwitch(self.gen, "dns_log")),
         row("启用流量统计 (Enable Statistics)", "统计各入站与出站节点的实时流量", flagSwitch(self.gen, "stats")),
         row("启用节点连通性观测器 (Enable Observatory)", "后台定期探测出站节点延迟，支撑 leastPing 策略与状态页展示", flagSwitch(self.gen, "observatory")),
-        row("启用 Metrics 监控接口 (Metrics Server)", "开启本地 HTTP debug/vars 统计接口", flagSwitch(self.gen, "metrics_server_enable")),
-        row("Metrics 监控监听端口", "默认 18888", textInput(self.gen, "metrics_server_port", "18888")),
+        row("启用Metrics 监控接口 (Metrics Server)", "开启本地 HTTP debug/vars 统计接口", flagSwitch(self.gen, "metrics_server_enable")),
+        self.gen.metrics_server_enable === "1"
+          ? row("Metrics 监控监听端口", "默认 18888", textInput(self.gen, "metrics_server_port", "18888"))
+          : null,
         row("启用 Firewall4 规则计数器", "在 nftables 中统计透明代理匹配包数", flagSwitch(self.gen, "fw4_counter")),
 
         h("div", { class: "xgl-section-title" }, "防火墙标记与连接超时策略 (Firewall & Policy)"),
