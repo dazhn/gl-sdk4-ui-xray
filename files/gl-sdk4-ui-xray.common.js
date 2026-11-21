@@ -80,14 +80,24 @@
     "        outboundTag: \"blackhole_outbound\"",
     "    });",
     "",
-    "    // 2. 在兜底规则前追加 v2rayN 黑名单 IP 集，并将最终兜底改为 direct",
-    "    let blacklist_ips = [",
+    "    // 2. 在兜底规则前追加 v2rayN 黑名单 IP 集 (IPv4 & IPv6)，并将最终兜底改为 direct",
+    "    let blacklist_ips_v4 = [",
     "        \"geoip:facebook\", \"geoip:fastly\", \"geoip:google\",",
     "        \"geoip:netflix\", \"geoip:telegram\", \"geoip:twitter\",",
     "        \"1.1.1.1\", \"1.0.0.1\", \"1.1.1.2\", \"1.0.0.2\", \"1.1.1.3\", \"1.0.0.3\",",
     "        \"8.8.8.8\", \"8.8.4.4\", \"94.140.14.14\", \"94.140.15.15\",",
     "        \"208.67.222.222\", \"208.67.220.220\", \"9.9.9.9\", \"149.112.112.112\",",
     "        \"77.88.8.8\", \"77.88.8.1\"",
+    "    ];",
+    "    let blacklist_ips_v6 = [",
+    "        \"geoip:facebook\", \"geoip:fastly\", \"geoip:google\",",
+    "        \"geoip:netflix\", \"geoip:telegram\", \"geoip:twitter\",",
+    "        \"2606:4700:4700::1111\", \"2606:4700:4700::1001\",",
+    "        \"2001:4860:4860::8888\", \"2001:4860:4860::8844\",",
+    "        \"2a10:50c0::ad1:ff\", \"2a10:50c0::ad2:ff\",",
+    "        \"2620:119:35::35\", \"2620:119:53::53\",",
+    "        \"2620:fe::9\", \"2620:fe::fe\",",
+    "        \"2a02:6b8::feed:0ff\", \"2a02:6b8:0:1::feed:0ff\"",
     "    ];",
     "    for (let r in config.routing.rules) {",
     "        if (r.domain == null && r.ip == null && (",
@@ -96,14 +106,13 @@
     "            r.balancerTag == \"tcp_outbound_v6\" ||",
     "            r.balancerTag == \"udp_outbound_v6\"",
     "        )) {",
-    "            if (r.balancerTag == \"tcp_outbound_v4\" || r.balancerTag == \"udp_outbound_v4\") {",
-    "                push(new_rules, {",
-    "                    type: \"field\",",
-    "                    inboundTag: r.inboundTag,",
-    "                    ip: blacklist_ips,",
-    "                    balancerTag: r.balancerTag",
-    "                });",
-    "            }",
+    "            let is_v4 = (r.balancerTag == \"tcp_outbound_v4\" || r.balancerTag == \"udp_outbound_v4\");",
+    "            push(new_rules, {",
+    "                type: \"field\",",
+    "                inboundTag: r.inboundTag,",
+    "                ip: is_v4 ? blacklist_ips_v4 : blacklist_ips_v6,",
+    "                balancerTag: r.balancerTag",
+    "            });",
     "            push(fallback_rules, {",
     "                type: \"field\",",
     "                inboundTag: r.inboundTag,",
@@ -433,7 +442,8 @@
         var bp = linesToArr(this.bypassedRulesText);
         var geo4 = linesToArr(this.geoipDirectV4Text);
         if (bp.indexOf("geosite:cn") >= 0 || geo4.indexOf("cn") >= 0) return "bypass_cn";
-        if (bp.length === 0 && geo4.length === 0 && !hook.trim()) return "global";
+        var onlyPrivateOrEmpty = bp.length === 0 || (bp.length === 1 && bp[0] === "geosite:private");
+        if (onlyPrivateOrEmpty && geo4.length === 0 && !hook.trim()) return "global";
         return "custom";
       },
 
@@ -445,7 +455,12 @@
           this.blockedRulesText = "geosite:category-ads";
           this.geoipDirectV4Text = "cn";
           this.geoipDirectV6Text = "cn";
+          this.$set(this.gen, "fast_dns", "223.5.5.5:53");
+          this.$set(this.gen, "secure_dns", "1.1.1.1:53");
           this.$set(this.gen, "default_dns", "1.1.1.1:53");
+          this.$set(this.gen, "tproxy_sniffing", "1");
+          this.$set(this.gen, "route_only", "1");
+          this.$set(this.gen, "routing_domain_strategy", "IPIfNonMatch");
           if (curHook.indexOf(BLACKLIST_HOOK_TAG) >= 0) {
             this.$set(this.gen, "custom_configuration_hook", "");
           }
@@ -475,14 +490,20 @@
           this.$set(this.gen, "tproxy_sniffing", "1");
           this.$set(this.gen, "route_only", "1");
           this.$set(this.gen, "direct_bittorrent", "1");
+          this.$set(this.gen, "routing_domain_strategy", "IPIfNonMatch");
           this.$set(this.gen, "custom_configuration_hook", BLACKLIST_HOOK_SCRIPT);
           this.showToast("已填入【黑名单模式 (参考 v2rayN)】，点击“保存并应用”生效");
         } else if (preset === "global") {
-          this.bypassedRulesText = "";
+          this.bypassedRulesText = "geosite:private";
           this.forwardedRulesText = "geosite:geolocation-!cn";
           this.geoipDirectV4Text = "";
           this.geoipDirectV6Text = "";
+          this.$set(this.gen, "fast_dns", "223.5.5.5:53");
+          this.$set(this.gen, "secure_dns", "1.1.1.1:53");
           this.$set(this.gen, "default_dns", "1.1.1.1:53");
+          this.$set(this.gen, "tproxy_sniffing", "1");
+          this.$set(this.gen, "route_only", "1");
+          this.$set(this.gen, "routing_domain_strategy", "AsIs");
           if (curHook.indexOf(BLACKLIST_HOOK_TAG) >= 0) {
             this.$set(this.gen, "custom_configuration_hook", "");
           }
