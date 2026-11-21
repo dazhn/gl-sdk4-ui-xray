@@ -230,8 +230,6 @@
         wanBpUdpPortsText: "",
         wanFwTcpPortsText: "",
         wanFwUdpPortsText: "",
-        tproxyIfacesV4Text: "br-lan",
-        tproxyIfacesV6Text: "br-lan",
 
         // Server search, protocol filter, import, and modal editing
         serverKeyword: "",
@@ -308,9 +306,7 @@
           wan_bp_tcp_ports: linesToArr(this.wanBpTcpPortsText),
           wan_bp_udp_ports: linesToArr(this.wanBpUdpPortsText),
           wan_fw_tcp_ports: linesToArr(this.wanFwTcpPortsText),
-          wan_fw_udp_ports: linesToArr(this.wanFwUdpPortsText),
-          tproxy_ifaces_v4: linesToArr(this.tproxyIfacesV4Text),
-          tproxy_ifaces_v6: linesToArr(this.tproxyIfacesV6Text)
+          wan_fw_udp_ports: linesToArr(this.wanFwUdpPortsText)
         });
       },
       buildGeneralSnapshot: function () {
@@ -391,19 +387,11 @@
             blocked_to_loopback: g.blocked_to_loopback || "0",
             align_fast_dns_to_geoip_direct: g.align_fast_dns_to_geoip_direct || "0",
             dnsmasq_integration_mode: g.dnsmasq_integration_mode || "global",
-            pool_v4: g.pool_v4 || "198.18.0.0/15",
-            pool_v4_size: g.pool_v4_size || "65535",
-            pool_v6: g.pool_v6 || "2001:2::/48",
-            pool_v6_size: g.pool_v6_size || "65535",
             transparent_default_port_policy: g.transparent_default_port_policy || "forwarded",
             tproxy_sniffing: g.tproxy_sniffing || "0",
             route_only: g.route_only || "0",
             direct_bittorrent: g.direct_bittorrent || "0",
             routing_domain_strategy: g.routing_domain_strategy || "AsIs",
-            tproxy_port_tcp_v4: g.tproxy_port_tcp_v4 || "1082",
-            tproxy_port_tcp_v6: g.tproxy_port_tcp_v6 || "1083",
-            tproxy_port_udp_v4: g.tproxy_port_udp_v4 || "1084",
-            tproxy_port_udp_v6: g.tproxy_port_udp_v6 || "1085",
             xray_bin: g.xray_bin || "/usr/bin/xray",
             loglevel: g.loglevel || "warning",
             access_log: g.access_log || "0",
@@ -441,8 +429,6 @@
           self.wanBpUdpPortsText = arrToLines(g.wan_bp_udp_ports);
           self.wanFwTcpPortsText = arrToLines(g.wan_fw_tcp_ports);
           self.wanFwUdpPortsText = arrToLines(g.wan_fw_udp_ports);
-          self.tproxyIfacesV4Text = arrToLines(g.tproxy_ifaces_v4 || ["br-lan"]);
-          self.tproxyIfacesV6Text = arrToLines(g.tproxy_ifaces_v6 || ["br-lan"]);
 
           self.savedSnapshot = self.buildGeneralSnapshot();
         }).catch(function (e) {

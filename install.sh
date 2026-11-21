@@ -586,69 +586,6 @@ function M.save_general(args)
     return { code = 0, data = { ok = true } }
 end
 
-local BLACKLIST_HOOK = [[// __GL_XRAY_PRESET_BLACKLIST__
-return function(config) {
-    let new_rules = [];
-    let fallback_rules = [];
-
-    // 1. 阻断 UDP 443 (QUIC)，对应 v2rayN 阻断udp443
-    push(new_rules, {
-        type: "field",
-        port: "443",
-        network: "udp",
-        outboundTag: "blackhole_outbound"
-    });
-
-    // 2. 在兜底规则前追加 v2rayN 黑名单 IP 集 (IPv4 & IPv6)，并将最终兜底改为 direct
-    let blacklist_ips_v4 = [
-        "geoip:facebook", "geoip:fastly", "geoip:google",
-        "geoip:netflix", "geoip:telegram", "geoip:twitter",
-        "1.1.1.1", "1.0.0.1", "1.1.1.2", "1.0.0.2", "1.1.1.3", "1.0.0.3",
-        "8.8.8.8", "8.8.4.4", "94.140.14.14", "94.140.15.15",
-        "208.67.222.222", "208.67.220.220", "9.9.9.9", "149.112.112.112",
-        "77.88.8.8", "77.88.8.1"
-    ];
-    let blacklist_ips_v6 = [
-        "geoip:facebook", "geoip:fastly", "geoip:google",
-        "geoip:netflix", "geoip:telegram", "geoip:twitter",
-        "2606:4700:4700::1111", "2606:4700:4700::1001",
-        "2001:4860:4860::8888", "2001:4860:4860::8844",
-        "2a10:50c0::ad1:ff", "2a10:50c0::ad2:ff",
-        "2620:119:35::35", "2620:119:53::53",
-        "2620:fe::9", "2620:fe::fe",
-        "2a02:6b8::feed:0ff", "2a02:6b8:0:1::feed:0ff"
-    ];
-    for (let r in config.routing.rules) {
-        if (r.domain == null && r.ip == null && (
-            r.balancerTag == "tcp_outbound_v4" ||
-            r.balancerTag == "udp_outbound_v4" ||
-            r.balancerTag == "tcp_outbound_v6" ||
-            r.balancerTag == "udp_outbound_v6"
-        )) {
-            let is_v4 = (r.balancerTag == "tcp_outbound_v4" || r.balancerTag == "udp_outbound_v4");
-            push(new_rules, {
-                type: "field",
-                inboundTag: r.inboundTag,
-                ip: is_v4 ? blacklist_ips_v4 : blacklist_ips_v6,
-                balancerTag: r.balancerTag
-            });
-            push(fallback_rules, {
-                type: "field",
-                inboundTag: r.inboundTag,
-                outboundTag: "direct"
-            });
-        } else {
-            push(new_rules, r);
-        }
-    }
-
-    for (let fb in fallback_rules) {
-        push(new_rules, fb);
-    }
-    config.routing.rules = new_rules;
-    return config;
-};]]
-
 local function filter_valid_servers(c, list)
     local out = {}
     if type(list) == "string" then list = { list } end
@@ -661,13 +598,13 @@ local function filter_valid_servers(c, list)
     return out
 end
 
--- 3. Quick switch active TCP/UDP node & mode
+-- 3. Quick switch active TCP/UDP node
 function M.switch_node(args)
     if type(args) ~= "table" then
         return { code = -1, error = "参数错误" }
     end
     local c = uci.cursor()
-    local gen_id, gen = get_general_section(c)
+    local gen_id = get_general_section(c)
 
     if args.enabled ~= nil then
         c:set("xray_core", gen_id, "transparent_proxy_enable", args.enabled and "1" or "0")
@@ -684,57 +621,6 @@ function M.switch_node(args)
         return { code = -1, error = "指定的 UDP 节点不存在" }
     elseif #udp_list > 0 then
         c:set("xray_core", gen_id, "udp_balancer_v4", udp_list)
-    end
-
-    local cur_hook = type(gen.custom_configuration_hook) == "string" and gen.custom_configuration_hook or ""
-    if args.preset == "bypass_cn" then
-        c:set("xray_core", gen_id, "bypassed_domain_rules", { "geosite:private", "geosite:cn" })
-        c:set("xray_core", gen_id, "forwarded_domain_rules", { "geosite:geolocation-!cn" })
-        c:set("xray_core", gen_id, "blocked_domain_rules", { "geosite:category-ads" })
-        c:set("xray_core", gen_id, "geoip_direct_code_list", { "cn" })
-        c:set("xray_core", gen_id, "geoip_direct_code_list_v6", { "cn" })
-        c:set("xray_core", gen_id, "fast_dns", "223.5.5.5:53")
-        c:set("xray_core", gen_id, "secure_dns", "1.1.1.1:53")
-        c:set("xray_core", gen_id, "default_dns", "1.1.1.1:53")
-        c:set("xray_core", gen_id, "tproxy_sniffing", "1")
-        c:set("xray_core", gen_id, "route_only", "1")
-        c:set("xray_core", gen_id, "routing_domain_strategy", "IPIfNonMatch")
-        if cur_hook:find("__GL_XRAY_PRESET_BLACKLIST__", 1, true) then
-            c:delete("xray_core", gen_id, "custom_configuration_hook")
-        end
-    elseif args.preset == "blacklist" then
-        c:set("xray_core", gen_id, "bypassed_domain_rules", { "geosite:private", "geosite:cn" })
-        c:set("xray_core", gen_id, "forwarded_domain_rules", {
-            "geosite:gfw", "geosite:greatfire", "geosite:google", "domain:api.ip.sb",
-            "domain:cloudflare-dns.com", "domain:one.one.one.one", "domain:dns.google",
-            "domain:adguard-dns.com", "domain:opendns.com", "domain:umbrella.com",
-            "domain:quad9.net", "domain:yandex.net"
-        })
-        c:set("xray_core", gen_id, "blocked_domain_rules", { "geosite:category-ads" })
-        c:delete("xray_core", gen_id, "geoip_direct_code_list")
-        c:delete("xray_core", gen_id, "geoip_direct_code_list_v6")
-        c:set("xray_core", gen_id, "fast_dns", "223.5.5.5:53")
-        c:set("xray_core", gen_id, "secure_dns", "1.1.1.1:53")
-        c:set("xray_core", gen_id, "default_dns", "223.5.5.5:53")
-        c:set("xray_core", gen_id, "tproxy_sniffing", "1")
-        c:set("xray_core", gen_id, "route_only", "1")
-        c:set("xray_core", gen_id, "direct_bittorrent", "1")
-        c:set("xray_core", gen_id, "routing_domain_strategy", "IPIfNonMatch")
-        c:set("xray_core", gen_id, "custom_configuration_hook", BLACKLIST_HOOK)
-    elseif args.preset == "global" then
-        c:set("xray_core", gen_id, "bypassed_domain_rules", { "geosite:private" })
-        c:set("xray_core", gen_id, "forwarded_domain_rules", { "geosite:geolocation-!cn" })
-        c:delete("xray_core", gen_id, "geoip_direct_code_list")
-        c:delete("xray_core", gen_id, "geoip_direct_code_list_v6")
-        c:set("xray_core", gen_id, "fast_dns", "223.5.5.5:53")
-        c:set("xray_core", gen_id, "secure_dns", "1.1.1.1:53")
-        c:set("xray_core", gen_id, "default_dns", "1.1.1.1:53")
-        c:set("xray_core", gen_id, "tproxy_sniffing", "1")
-        c:set("xray_core", gen_id, "route_only", "1")
-        c:set("xray_core", gen_id, "routing_domain_strategy", "AsIs")
-        if cur_hook:find("__GL_XRAY_PRESET_BLACKLIST__", 1, true) then
-            c:delete("xray_core", gen_id, "custom_configuration_hook")
-        end
     end
 
     c:commit("xray_core")
@@ -1592,8 +1478,6 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         wanBpUdpPortsText: "",
         wanFwTcpPortsText: "",
         wanFwUdpPortsText: "",
-        tproxyIfacesV4Text: "br-lan",
-        tproxyIfacesV6Text: "br-lan",
 
         // Server search, protocol filter, import, and modal editing
         serverKeyword: "",
@@ -1670,9 +1554,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           wan_bp_tcp_ports: linesToArr(this.wanBpTcpPortsText),
           wan_bp_udp_ports: linesToArr(this.wanBpUdpPortsText),
           wan_fw_tcp_ports: linesToArr(this.wanFwTcpPortsText),
-          wan_fw_udp_ports: linesToArr(this.wanFwUdpPortsText),
-          tproxy_ifaces_v4: linesToArr(this.tproxyIfacesV4Text),
-          tproxy_ifaces_v6: linesToArr(this.tproxyIfacesV6Text)
+          wan_fw_udp_ports: linesToArr(this.wanFwUdpPortsText)
         });
       },
       buildGeneralSnapshot: function () {
@@ -1753,19 +1635,11 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
             blocked_to_loopback: g.blocked_to_loopback || "0",
             align_fast_dns_to_geoip_direct: g.align_fast_dns_to_geoip_direct || "0",
             dnsmasq_integration_mode: g.dnsmasq_integration_mode || "global",
-            pool_v4: g.pool_v4 || "198.18.0.0/15",
-            pool_v4_size: g.pool_v4_size || "65535",
-            pool_v6: g.pool_v6 || "2001:2::/48",
-            pool_v6_size: g.pool_v6_size || "65535",
             transparent_default_port_policy: g.transparent_default_port_policy || "forwarded",
             tproxy_sniffing: g.tproxy_sniffing || "0",
             route_only: g.route_only || "0",
             direct_bittorrent: g.direct_bittorrent || "0",
             routing_domain_strategy: g.routing_domain_strategy || "AsIs",
-            tproxy_port_tcp_v4: g.tproxy_port_tcp_v4 || "1082",
-            tproxy_port_tcp_v6: g.tproxy_port_tcp_v6 || "1083",
-            tproxy_port_udp_v4: g.tproxy_port_udp_v4 || "1084",
-            tproxy_port_udp_v6: g.tproxy_port_udp_v6 || "1085",
             xray_bin: g.xray_bin || "/usr/bin/xray",
             loglevel: g.loglevel || "warning",
             access_log: g.access_log || "0",
@@ -1803,8 +1677,6 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           self.wanBpUdpPortsText = arrToLines(g.wan_bp_udp_ports);
           self.wanFwTcpPortsText = arrToLines(g.wan_fw_tcp_ports);
           self.wanFwUdpPortsText = arrToLines(g.wan_fw_udp_ports);
-          self.tproxyIfacesV4Text = arrToLines(g.tproxy_ifaces_v4 || ["br-lan"]);
-          self.tproxyIfacesV6Text = arrToLines(g.tproxy_ifaces_v6 || ["br-lan"]);
 
           self.savedSnapshot = self.buildGeneralSnapshot();
         }).catch(function (e) {
