@@ -199,6 +199,7 @@
         geoip_size: "0 MB",
         geosite_ok: false,
         geosite_size: "0 MB",
+        updatingGeo: false,
         metrics: null,
         metricsTimer: null,
         cnPing: null,
@@ -262,7 +263,7 @@
       self.loadAll();
       self.metricsTimer = setInterval(function () {
         if (typeof document !== "undefined" && document.hidden) return;
-        if (!self.proc_running || self.gen.metrics_server_enable !== "1") return;
+        if (!self.updatingGeo && (!self.proc_running || self.gen.metrics_server_enable !== "1")) return;
         self.refreshMetrics();
       }, 5000);
       self._onKeyDown = function (e) {
@@ -321,6 +322,20 @@
           self.running = !!d.running;
           self.proc_running = d.proc_running != null ? !!d.proc_running : !!d.running;
           self.tproxy_enabled = !!d.tproxy_enabled;
+          if (d.geoip_size) {
+            self.geoip_ok = !!d.geoip_ok;
+            self.geoip_size = d.geoip_size;
+            self.geosite_ok = !!d.geosite_ok;
+            self.geosite_size = d.geosite_size;
+          }
+          if (self.updatingGeo && d.geo_status && d.geo_status !== "updating") {
+            self.updatingGeo = false;
+            if (d.geo_status === "ok") {
+              self.showToast("GeoIP / GeoSite 规则库更新成功并已重启 Xray！");
+            } else {
+              self.showToast("规则库下载失败，请检查网络连接");
+            }
+          }
           self.metrics = d.metrics || null;
         }).catch(function () {});
       },
@@ -331,9 +346,10 @@
           if (self.toastMsg === msg) self.toastMsg = "";
         }, 3200);
       },
-      loadAll: function () {
+      loadAll: function (preserveUnsaved) {
         var self = this;
-        self.loading = true;
+        var keepForm = !!(preserveUnsaved && self.isDirty);
+        if (!keepForm) self.loading = true;
         return callRpc("get_all", {}).then(function (d) {
           self.running = !!d.running;
           self.proc_running = d.proc_running != null ? !!d.proc_running : !!d.running;
@@ -342,8 +358,28 @@
           self.geoip_size = d.geoip_size || "0 MB";
           self.geosite_ok = !!d.geosite_ok;
           self.geosite_size = d.geosite_size || "0 MB";
+          self.updatingGeo = d.geo_status === "updating";
           self.metrics = d.metrics || null;
+          self.servers = Array.isArray(d.servers) ? d.servers : [];
+          self.subsections = d.subsections || { lan_hosts: [], extra_inbound: [] };
+          self.lan_clients = Array.isArray(d.lan_clients) ? d.lan_clients : [];
+          if (!self.newInbound.destination && self.servers.length > 0) {
+            self.newInbound.destination = self.servers[0][".name"];
+          }
           var g = d.general || {};
+          if (g.subscription_url && !self.importText) {
+            self.importText = g.subscription_url;
+            self.importReplaceAll = true;
+          }
+          if (keepForm) {
+            var validMap = {};
+            self.servers.forEach(function (s) { validMap[s[".name"]] = true; });
+            self.tcpNodesV4 = self.tcpNodesV4.filter(function (id) { return validMap[id]; });
+            self.udpNodesV4 = self.udpNodesV4.filter(function (id) { return validMap[id]; });
+            self.tcpNodesV6 = self.tcpNodesV6.filter(function (id) { return validMap[id]; });
+            self.udpNodesV6 = self.udpNodesV6.filter(function (id) { return validMap[id]; });
+            return;
+          }
           self.gen = {
             transparent_proxy_enable: g.transparent_proxy_enable || "0",
             general_balancer_strategy: g.general_balancer_strategy || "random",
@@ -408,12 +444,6 @@
           self.tproxyIfacesV4Text = arrToLines(g.tproxy_ifaces_v4 || ["br-lan"]);
           self.tproxyIfacesV6Text = arrToLines(g.tproxy_ifaces_v6 || ["br-lan"]);
 
-          self.servers = Array.isArray(d.servers) ? d.servers : [];
-          self.subsections = d.subsections || { lan_hosts: [], extra_inbound: [] };
-          self.lan_clients = Array.isArray(d.lan_clients) ? d.lan_clients : [];
-          if (!self.newInbound.destination && self.servers.length > 0) {
-            self.newInbound.destination = self.servers[0][".name"];
-          }
           self.savedSnapshot = self.buildGeneralSnapshot();
         }).catch(function (e) {
           self.showToast("加载失败: " + e.message);
@@ -513,6 +543,13 @@
 
       quickUseServer: function (srvId) {
         var self = this;
+        self.tcpNodesV4 = [srvId];
+        self.udpNodesV4 = [srvId];
+        self.$set(self.gen, "transparent_proxy_enable", "1");
+        if (self.isDirty) {
+          self.saveAllGeneral();
+          return;
+        }
         self.saving = true;
         callRpc("switch_node", {
           enabled: true,
@@ -526,6 +563,23 @@
         }).finally(function () {
           self.saving = false;
         });
+      },
+
+      addFilteredToV4Pool: function (list) {
+        var tcpArr = this.tcpNodesV4.slice();
+        var udpArr = this.udpNodesV4.slice();
+        var added = 0;
+        (list || []).forEach(function (srv) {
+          var host = (srv.server || "").toLowerCase();
+          var alias = srv.alias || "";
+          if (host === "www.g00gle.com" || alias.indexOf("剩余流量") >= 0 || alias.indexOf("过期时间") >= 0) return;
+          var id = srv[".name"];
+          if (tcpArr.indexOf(id) < 0) { tcpArr.push(id); added++; }
+          if (udpArr.indexOf(id) < 0) udpArr.push(id);
+        });
+        this.tcpNodesV4 = tcpArr;
+        this.udpNodesV4 = udpArr;
+        this.showToast(added > 0 ? ("已将 " + added + " 个筛选节点加入 IPv4 池，请点击保存生效") : "当前筛选节点已全部在 IPv4 池中");
       },
 
       togglePoolNode: function (poolKey, srvId) {
@@ -668,7 +722,6 @@
           vals.shadowsocks_udp_over_tcp = ed.shadowsocks_udp_over_tcp;
         } else if (p === "vmess") {
           vals.vmess_security = ed.vmess_security;
-          vals.vmess_alter_id = ed.vmess_alter_id;
           vals.alter_id = ed.vmess_alter_id;
         } else if (p === "vless") {
           vals.vless_encryption = ed.vless_encryption || "none";
@@ -702,7 +755,7 @@
         callRpc("save_server", { id: ed.id, values: vals, apply: !!applyNow }, applyNow ? 35000 : 12000).then(function () {
           self.editingServer = null;
           self.showToast(applyNow ? "节点已保存并应用生效" : "节点已保存");
-          return self.loadAll();
+          return self.loadAll(true);
         }).catch(function (e) {
           self.showToast("保存节点失败: " + e.message);
         }).finally(function () {
@@ -715,7 +768,7 @@
         if (!confirm("确定要删除节点 " + (alias || id) + " (" + id + ") 吗？")) return;
         callRpc("delete_server", { id: id }, 35000).then(function (res) {
           self.showToast(res && res.restarted ? "已删除节点并自动同步重启服务" : "已删除节点");
-          self.loadAll();
+          self.loadAll(true);
         }).catch(function (e) {
           self.showToast("删除失败: " + e.message);
         });
@@ -733,9 +786,8 @@
           replace_all: self.importReplaceAll
         }, 35000).then(function (res) {
           self.showToast("成功导入 " + res.added + " 个节点！");
-          self.importText = "";
           self.showImportBox = false;
-          self.loadAll();
+          self.loadAll(!self.importReplaceAll);
         }).catch(function (e) {
           self.showToast("导入失败: " + e.message);
         }).finally(function () {
@@ -842,9 +894,12 @@
 
       triggerGeoUpdate: function () {
         var self = this;
+        if (self.updatingGeo) return;
+        self.updatingGeo = true;
         callRpc("update_geodata", {}).then(function () {
-          self.showToast("已在后台开始下载最新 GeoIP / GeoSite 规则库，完成后将自动重启 Xray");
+          self.showToast("正在后台下载最新 GeoIP / GeoSite 规则库，完成后将自动提示并重启 Xray");
         }).catch(function (e) {
+          self.updatingGeo = false;
           self.showToast("触发规则更新失败: " + e.message);
         });
       },
@@ -1094,6 +1149,11 @@
               domProps: { value: self.serverKeyword },
               on: { input: function (e) { self.serverKeyword = e.target.value; } }
             }),
+            ((kw || protoF) && filteredServers.length > 0) ? h("button", {
+              class: "xgl-btn sm",
+              attrs: { title: "将当前筛选出的有效节点全部加入 IPv4 负载均衡池" },
+              on: { click: function () { self.addFilteredToV4Pool(filteredServers); } }
+            }, "➕ 筛选入v4池 (" + filteredServers.length + ")") : null,
             h("button", { class: "xgl-btn sm primary", on: { click: function () { self.showImportBox = !self.showImportBox; } } }, "📥 订阅 / 链接导入"),
             h("button", { class: "xgl-btn sm success", on: { click: function () { self.openEditServer(null); } } }, "➕ 新增节点")
           ])
@@ -1194,7 +1254,11 @@
       var tabDns = h("div", [
         h("div", { class: "xgl-section-title" }, [
           h("span", "分流 DNS 与去广告域名规则"),
-          h("button", { class: "xgl-btn sm", on: { click: self.triggerGeoUpdate } }, "🌐 在线更新 GeoIP / GeoSite 规则库")
+          h("button", {
+            class: "xgl-btn sm",
+            attrs: { disabled: self.updatingGeo },
+            on: { click: self.triggerGeoUpdate }
+          }, self.updatingGeo ? "⏳ 正在下载更新规则库..." : "🌐 在线更新 GeoIP / GeoSite 规则库")
         ]),
         row("国内快速 DNS (Fast DNS)", "用于解析代理服务器入口域名及下方直连白名单域名（填 IP:端口，推荐 223.5.5.5:53）", textInput(self.gen, "fast_dns", "223.5.5.5:53")),
         row("直连域名规则 (Bypassed Domain Rules)", "每行一条，匹配域名使用快速 DNS 解析且直接绕过代理直连（如 geosite:cn）", autoTextarea(self, "bypassedRulesText", "例如 geosite:cn（回车可输入多行）")),

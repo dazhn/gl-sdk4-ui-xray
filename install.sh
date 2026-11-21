@@ -522,6 +522,7 @@ function M.get_all()
 
     local geoip_ok, geoip_sz = file_size_mb("/usr/share/xray/geoip.dat")
     local geosite_ok, geosite_sz = file_size_mb("/usr/share/xray/geosite.dat")
+    local geo_status = trim(read_file("/tmp/xray_geo_update.status") or "")
     local running, proc_alive, tproxy_active = get_xray_status(gen)
     local metrics = proc_alive and fetch_metrics_summary(gen.metrics_server_port) or nil
 
@@ -535,6 +536,7 @@ function M.get_all()
             geoip_size = geoip_sz,
             geosite_ok = geosite_ok,
             geosite_size = geosite_sz,
+            geo_status = geo_status,
             metrics = metrics,
             general_id = gen_id,
             general = clean_uci_section(gen),
@@ -549,12 +551,20 @@ function M.get_metrics()
     local c = uci.cursor()
     local _, gen = get_general_section(c)
     local running, proc_alive, tproxy_active = get_xray_status(gen)
+    local geoip_ok, geoip_sz = file_size_mb("/usr/share/xray/geoip.dat")
+    local geosite_ok, geosite_sz = file_size_mb("/usr/share/xray/geosite.dat")
+    local geo_status = trim(read_file("/tmp/xray_geo_update.status") or "")
     return {
         code = 0,
         data = {
             running = running,
             proc_running = proc_alive,
             tproxy_enabled = tproxy_active,
+            geoip_ok = geoip_ok,
+            geoip_size = geoip_sz,
+            geosite_ok = geosite_ok,
+            geosite_size = geosite_sz,
+            geo_status = geo_status,
             metrics = proc_alive and fetch_metrics_summary(gen and gen.metrics_server_port) or nil
         }
     }
@@ -892,7 +902,6 @@ local function parse_single_uri(line)
                 password = safe_str(j.id),
                 protocol = "vmess",
                 vmess_security = safe_str(j.scy, "auto"),
-                vmess_alter_id = j_aid,
                 alter_id = j_aid,
                 vmess_tls = tls_mode,
                 transport = net,
@@ -1081,6 +1090,18 @@ local function parse_single_uri(line)
     return nil
 end
 
+local function is_fake_info_server(srv)
+    local host = (srv.server or ""):lower()
+    if host == "www.g00gle.com" or host == "127.0.0.1" or host == "0.0.0.0" or host == "localhost" then
+        return true
+    end
+    local a = srv.alias or ""
+    if a:find("剩余流量", 1, true) or a:find("过期时间", 1, true) or a:find("到期时间", 1, true) or a:find("套餐到期", 1, true) then
+        return true
+    end
+    return false
+end
+
 function M.import_links(args)
     if type(args) ~= "table" or type(args.text) ~= "string" then
         return { code = -1, error = "请输入订阅链接或节点分享链接" }
@@ -1090,8 +1111,10 @@ function M.import_links(args)
         return { code = -1, error = "内容不能为空" }
     end
 
+    local sub_url = nil
     -- If input is a single HTTP/HTTPS subscription URL, fetch it non-blockingly via ngx.pipe.spawn
     if input:match("^https?://[^%s]+$") then
+        sub_url = input
         local body = spawn_read({
             "curl", "-fsSL", "--connect-timeout", "10", "-m", "20", "-A", "v2rayN/6.45", input
         }, 22000)
@@ -1122,40 +1145,76 @@ function M.import_links(args)
     end
 
     local c = uci.cursor()
-    local deleted_map = {}
+    local gen_id, gen = get_general_section(c)
+    if sub_url then
+        c:set("xray_core", gen_id, "subscription_url", sub_url)
+    end
+
+    local prev_pool_aliases = {}
     if args.replace_all then
+        local id_to_alias = {}
         local to_del = {}
+        local deleted_map = {}
         c:foreach("xray_core", "servers", function(s)
             local sid = s[".name"]
             to_del[#to_del + 1] = sid
             deleted_map[sid] = true
+            if s.alias and s.alias ~= "" then
+                id_to_alias[sid] = s.alias
+            end
         end)
+        for _, pk in ipairs({ "tcp_balancer_v4", "udp_balancer_v4", "tcp_balancer_v6", "udp_balancer_v6" }) do
+            local pool = gen[pk]
+            if type(pool) == "string" then pool = { pool } end
+            if type(pool) == "table" then
+                local aliases = {}
+                for _, id in ipairs(pool) do
+                    if id_to_alias[id] then aliases[#aliases + 1] = id_to_alias[id] end
+                end
+                prev_pool_aliases[pk] = aliases
+            end
+        end
         for _, id in ipairs(to_del) do c:delete("xray_core", id) end
+        cleanup_deleted_server_refs(c, deleted_map)
     end
 
-    local first_new_id = nil
+    local first_any_id = nil
+    local first_valid_id = nil
+    local alias_to_new_id = {}
     for _, srv in ipairs(parsed_list) do
         local sec = next_server_id(c)
-        if not first_new_id then first_new_id = sec end
+        if not first_any_id then first_any_id = sec end
+        if not first_valid_id and not is_fake_info_server(srv) then
+            first_valid_id = sec
+        end
+        if srv.alias and srv.alias ~= "" and not alias_to_new_id[srv.alias] then
+            alias_to_new_id[srv.alias] = sec
+        end
         c:set("xray_core", sec, "servers")
         apply_uci_fields(c, "xray_core", sec, srv)
     end
 
-    if args.replace_all and first_new_id then
-        cleanup_deleted_server_refs(c, deleted_map)
-        local gen_id, gen = get_general_section(c)
-        if not gen.tcp_balancer_v4 or #gen.tcp_balancer_v4 == 0 then
-            c:set("xray_core", gen_id, "tcp_balancer_v4", { first_new_id })
-        end
-        if not gen.udp_balancer_v4 or #gen.udp_balancer_v4 == 0 then
-            c:set("xray_core", gen_id, "udp_balancer_v4", { first_new_id })
+    local fallback_id = first_valid_id or first_any_id
+    if args.replace_all and fallback_id then
+        for _, pk in ipairs({ "tcp_balancer_v4", "udp_balancer_v4", "tcp_balancer_v6", "udp_balancer_v6" }) do
+            local restored = {}
+            for _, al in ipairs(prev_pool_aliases[pk] or {}) do
+                if alias_to_new_id[al] then
+                    restored[#restored + 1] = alias_to_new_id[al]
+                end
+            end
+            if #restored > 0 then
+                c:set("xray_core", gen_id, pk, restored)
+            elseif pk == "tcp_balancer_v4" or pk == "udp_balancer_v4" then
+                c:set("xray_core", gen_id, pk, { fallback_id })
+            end
         end
     end
 
     c:commit("xray_core")
     if args.replace_all then
-        local _, gen = get_general_section(c)
-        local _, proc_alive = get_xray_status(gen)
+        local _, cur_gen = get_general_section(c)
+        local _, proc_alive = get_xray_status(cur_gen)
         if proc_alive then
             service_exec("restart")
         end
@@ -1163,14 +1222,10 @@ function M.import_links(args)
     return { code = 0, data = { added = #parsed_list } }
 end
 
--- 7. Generic subsection CRUD (lan_hosts, extra_inbound, fakedns, manual_tproxy, bridge)
+-- 7. Generic subsection CRUD (lan_hosts, extra_inbound)
 local allowed_sub_types = {
     lan_hosts = true,
-    extra_inbound = true,
-    fakedns = true,
-    manual_tproxy = true,
-    bridge = true,
-    fallback = true
+    extra_inbound = true
 }
 
 function M.save_subsection(args)
@@ -1262,6 +1317,11 @@ end
 
 -- 11. Online update GeoIP / GeoSite from Loyalsoldier/v2ray-rules-dat (with domestic mirror & CDN fallback)
 function M.update_geodata()
+    local sf = io.open("/tmp/xray_geo_update.status", "w")
+    if sf then
+        sf:write("updating\n")
+        sf:close()
+    end
     local script = [[
 mkdir -p /usr/share/xray
 dl() {
@@ -1284,9 +1344,11 @@ dl() {
 if dl "geoip.dat" "/tmp/geoip.dat.new" && dl "geosite.dat" "/tmp/geosite.dat.new"; then
     mv /tmp/geoip.dat.new /usr/share/xray/geoip.dat
     mv /tmp/geosite.dat.new /usr/share/xray/geosite.dat
+    echo "ok" > /tmp/xray_geo_update.status
     /etc/init.d/xray_core restart
 else
     rm -f /tmp/geoip.dat.new /tmp/geosite.dat.new
+    echo "err" > /tmp/xray_geo_update.status
 fi
 ]]
     spawn_read({ "/bin/sh", "-c", "(" .. script .. ") >/tmp/xray_geo_update.log 2>&1 &" }, 2000)
@@ -1499,6 +1561,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         geoip_size: "0 MB",
         geosite_ok: false,
         geosite_size: "0 MB",
+        updatingGeo: false,
         metrics: null,
         metricsTimer: null,
         cnPing: null,
@@ -1562,7 +1625,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
       self.loadAll();
       self.metricsTimer = setInterval(function () {
         if (typeof document !== "undefined" && document.hidden) return;
-        if (!self.proc_running || self.gen.metrics_server_enable !== "1") return;
+        if (!self.updatingGeo && (!self.proc_running || self.gen.metrics_server_enable !== "1")) return;
         self.refreshMetrics();
       }, 5000);
       self._onKeyDown = function (e) {
@@ -1621,6 +1684,20 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           self.running = !!d.running;
           self.proc_running = d.proc_running != null ? !!d.proc_running : !!d.running;
           self.tproxy_enabled = !!d.tproxy_enabled;
+          if (d.geoip_size) {
+            self.geoip_ok = !!d.geoip_ok;
+            self.geoip_size = d.geoip_size;
+            self.geosite_ok = !!d.geosite_ok;
+            self.geosite_size = d.geosite_size;
+          }
+          if (self.updatingGeo && d.geo_status && d.geo_status !== "updating") {
+            self.updatingGeo = false;
+            if (d.geo_status === "ok") {
+              self.showToast("GeoIP / GeoSite 规则库更新成功并已重启 Xray！");
+            } else {
+              self.showToast("规则库下载失败，请检查网络连接");
+            }
+          }
           self.metrics = d.metrics || null;
         }).catch(function () {});
       },
@@ -1631,9 +1708,10 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           if (self.toastMsg === msg) self.toastMsg = "";
         }, 3200);
       },
-      loadAll: function () {
+      loadAll: function (preserveUnsaved) {
         var self = this;
-        self.loading = true;
+        var keepForm = !!(preserveUnsaved && self.isDirty);
+        if (!keepForm) self.loading = true;
         return callRpc("get_all", {}).then(function (d) {
           self.running = !!d.running;
           self.proc_running = d.proc_running != null ? !!d.proc_running : !!d.running;
@@ -1642,8 +1720,28 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           self.geoip_size = d.geoip_size || "0 MB";
           self.geosite_ok = !!d.geosite_ok;
           self.geosite_size = d.geosite_size || "0 MB";
+          self.updatingGeo = d.geo_status === "updating";
           self.metrics = d.metrics || null;
+          self.servers = Array.isArray(d.servers) ? d.servers : [];
+          self.subsections = d.subsections || { lan_hosts: [], extra_inbound: [] };
+          self.lan_clients = Array.isArray(d.lan_clients) ? d.lan_clients : [];
+          if (!self.newInbound.destination && self.servers.length > 0) {
+            self.newInbound.destination = self.servers[0][".name"];
+          }
           var g = d.general || {};
+          if (g.subscription_url && !self.importText) {
+            self.importText = g.subscription_url;
+            self.importReplaceAll = true;
+          }
+          if (keepForm) {
+            var validMap = {};
+            self.servers.forEach(function (s) { validMap[s[".name"]] = true; });
+            self.tcpNodesV4 = self.tcpNodesV4.filter(function (id) { return validMap[id]; });
+            self.udpNodesV4 = self.udpNodesV4.filter(function (id) { return validMap[id]; });
+            self.tcpNodesV6 = self.tcpNodesV6.filter(function (id) { return validMap[id]; });
+            self.udpNodesV6 = self.udpNodesV6.filter(function (id) { return validMap[id]; });
+            return;
+          }
           self.gen = {
             transparent_proxy_enable: g.transparent_proxy_enable || "0",
             general_balancer_strategy: g.general_balancer_strategy || "random",
@@ -1708,12 +1806,6 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           self.tproxyIfacesV4Text = arrToLines(g.tproxy_ifaces_v4 || ["br-lan"]);
           self.tproxyIfacesV6Text = arrToLines(g.tproxy_ifaces_v6 || ["br-lan"]);
 
-          self.servers = Array.isArray(d.servers) ? d.servers : [];
-          self.subsections = d.subsections || { lan_hosts: [], extra_inbound: [] };
-          self.lan_clients = Array.isArray(d.lan_clients) ? d.lan_clients : [];
-          if (!self.newInbound.destination && self.servers.length > 0) {
-            self.newInbound.destination = self.servers[0][".name"];
-          }
           self.savedSnapshot = self.buildGeneralSnapshot();
         }).catch(function (e) {
           self.showToast("加载失败: " + e.message);
@@ -1813,6 +1905,13 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
 
       quickUseServer: function (srvId) {
         var self = this;
+        self.tcpNodesV4 = [srvId];
+        self.udpNodesV4 = [srvId];
+        self.$set(self.gen, "transparent_proxy_enable", "1");
+        if (self.isDirty) {
+          self.saveAllGeneral();
+          return;
+        }
         self.saving = true;
         callRpc("switch_node", {
           enabled: true,
@@ -1826,6 +1925,23 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         }).finally(function () {
           self.saving = false;
         });
+      },
+
+      addFilteredToV4Pool: function (list) {
+        var tcpArr = this.tcpNodesV4.slice();
+        var udpArr = this.udpNodesV4.slice();
+        var added = 0;
+        (list || []).forEach(function (srv) {
+          var host = (srv.server || "").toLowerCase();
+          var alias = srv.alias || "";
+          if (host === "www.g00gle.com" || alias.indexOf("剩余流量") >= 0 || alias.indexOf("过期时间") >= 0) return;
+          var id = srv[".name"];
+          if (tcpArr.indexOf(id) < 0) { tcpArr.push(id); added++; }
+          if (udpArr.indexOf(id) < 0) udpArr.push(id);
+        });
+        this.tcpNodesV4 = tcpArr;
+        this.udpNodesV4 = udpArr;
+        this.showToast(added > 0 ? ("已将 " + added + " 个筛选节点加入 IPv4 池，请点击保存生效") : "当前筛选节点已全部在 IPv4 池中");
       },
 
       togglePoolNode: function (poolKey, srvId) {
@@ -1968,7 +2084,6 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           vals.shadowsocks_udp_over_tcp = ed.shadowsocks_udp_over_tcp;
         } else if (p === "vmess") {
           vals.vmess_security = ed.vmess_security;
-          vals.vmess_alter_id = ed.vmess_alter_id;
           vals.alter_id = ed.vmess_alter_id;
         } else if (p === "vless") {
           vals.vless_encryption = ed.vless_encryption || "none";
@@ -2002,7 +2117,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         callRpc("save_server", { id: ed.id, values: vals, apply: !!applyNow }, applyNow ? 35000 : 12000).then(function () {
           self.editingServer = null;
           self.showToast(applyNow ? "节点已保存并应用生效" : "节点已保存");
-          return self.loadAll();
+          return self.loadAll(true);
         }).catch(function (e) {
           self.showToast("保存节点失败: " + e.message);
         }).finally(function () {
@@ -2015,7 +2130,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         if (!confirm("确定要删除节点 " + (alias || id) + " (" + id + ") 吗？")) return;
         callRpc("delete_server", { id: id }, 35000).then(function (res) {
           self.showToast(res && res.restarted ? "已删除节点并自动同步重启服务" : "已删除节点");
-          self.loadAll();
+          self.loadAll(true);
         }).catch(function (e) {
           self.showToast("删除失败: " + e.message);
         });
@@ -2033,9 +2148,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           replace_all: self.importReplaceAll
         }, 35000).then(function (res) {
           self.showToast("成功导入 " + res.added + " 个节点！");
-          self.importText = "";
           self.showImportBox = false;
-          self.loadAll();
+          self.loadAll(!self.importReplaceAll);
         }).catch(function (e) {
           self.showToast("导入失败: " + e.message);
         }).finally(function () {
@@ -2142,9 +2256,12 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
 
       triggerGeoUpdate: function () {
         var self = this;
+        if (self.updatingGeo) return;
+        self.updatingGeo = true;
         callRpc("update_geodata", {}).then(function () {
-          self.showToast("已在后台开始下载最新 GeoIP / GeoSite 规则库，完成后将自动重启 Xray");
+          self.showToast("正在后台下载最新 GeoIP / GeoSite 规则库，完成后将自动提示并重启 Xray");
         }).catch(function (e) {
+          self.updatingGeo = false;
           self.showToast("触发规则更新失败: " + e.message);
         });
       },
@@ -2394,6 +2511,11 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
               domProps: { value: self.serverKeyword },
               on: { input: function (e) { self.serverKeyword = e.target.value; } }
             }),
+            ((kw || protoF) && filteredServers.length > 0) ? h("button", {
+              class: "xgl-btn sm",
+              attrs: { title: "将当前筛选出的有效节点全部加入 IPv4 负载均衡池" },
+              on: { click: function () { self.addFilteredToV4Pool(filteredServers); } }
+            }, "➕ 筛选入v4池 (" + filteredServers.length + ")") : null,
             h("button", { class: "xgl-btn sm primary", on: { click: function () { self.showImportBox = !self.showImportBox; } } }, "📥 订阅 / 链接导入"),
             h("button", { class: "xgl-btn sm success", on: { click: function () { self.openEditServer(null); } } }, "➕ 新增节点")
           ])
@@ -2494,7 +2616,11 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
       var tabDns = h("div", [
         h("div", { class: "xgl-section-title" }, [
           h("span", "分流 DNS 与去广告域名规则"),
-          h("button", { class: "xgl-btn sm", on: { click: self.triggerGeoUpdate } }, "🌐 在线更新 GeoIP / GeoSite 规则库")
+          h("button", {
+            class: "xgl-btn sm",
+            attrs: { disabled: self.updatingGeo },
+            on: { click: self.triggerGeoUpdate }
+          }, self.updatingGeo ? "⏳ 正在下载更新规则库..." : "🌐 在线更新 GeoIP / GeoSite 规则库")
         ]),
         row("国内快速 DNS (Fast DNS)", "用于解析代理服务器入口域名及下方直连白名单域名（填 IP:端口，推荐 223.5.5.5:53）", textInput(self.gen, "fast_dns", "223.5.5.5:53")),
         row("直连域名规则 (Bypassed Domain Rules)", "每行一条，匹配域名使用快速 DNS 解析且直接绕过代理直连（如 geosite:cn）", autoTextarea(self, "bypassedRulesText", "例如 geosite:cn（回车可输入多行）")),

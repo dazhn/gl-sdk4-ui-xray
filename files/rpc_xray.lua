@@ -376,6 +376,7 @@ function M.get_all()
 
     local geoip_ok, geoip_sz = file_size_mb("/usr/share/xray/geoip.dat")
     local geosite_ok, geosite_sz = file_size_mb("/usr/share/xray/geosite.dat")
+    local geo_status = trim(read_file("/tmp/xray_geo_update.status") or "")
     local running, proc_alive, tproxy_active = get_xray_status(gen)
     local metrics = proc_alive and fetch_metrics_summary(gen.metrics_server_port) or nil
 
@@ -389,6 +390,7 @@ function M.get_all()
             geoip_size = geoip_sz,
             geosite_ok = geosite_ok,
             geosite_size = geosite_sz,
+            geo_status = geo_status,
             metrics = metrics,
             general_id = gen_id,
             general = clean_uci_section(gen),
@@ -403,12 +405,20 @@ function M.get_metrics()
     local c = uci.cursor()
     local _, gen = get_general_section(c)
     local running, proc_alive, tproxy_active = get_xray_status(gen)
+    local geoip_ok, geoip_sz = file_size_mb("/usr/share/xray/geoip.dat")
+    local geosite_ok, geosite_sz = file_size_mb("/usr/share/xray/geosite.dat")
+    local geo_status = trim(read_file("/tmp/xray_geo_update.status") or "")
     return {
         code = 0,
         data = {
             running = running,
             proc_running = proc_alive,
             tproxy_enabled = tproxy_active,
+            geoip_ok = geoip_ok,
+            geoip_size = geoip_sz,
+            geosite_ok = geosite_ok,
+            geosite_size = geosite_sz,
+            geo_status = geo_status,
             metrics = proc_alive and fetch_metrics_summary(gen and gen.metrics_server_port) or nil
         }
     }
@@ -746,7 +756,6 @@ local function parse_single_uri(line)
                 password = safe_str(j.id),
                 protocol = "vmess",
                 vmess_security = safe_str(j.scy, "auto"),
-                vmess_alter_id = j_aid,
                 alter_id = j_aid,
                 vmess_tls = tls_mode,
                 transport = net,
@@ -935,6 +944,18 @@ local function parse_single_uri(line)
     return nil
 end
 
+local function is_fake_info_server(srv)
+    local host = (srv.server or ""):lower()
+    if host == "www.g00gle.com" or host == "127.0.0.1" or host == "0.0.0.0" or host == "localhost" then
+        return true
+    end
+    local a = srv.alias or ""
+    if a:find("剩余流量", 1, true) or a:find("过期时间", 1, true) or a:find("到期时间", 1, true) or a:find("套餐到期", 1, true) then
+        return true
+    end
+    return false
+end
+
 function M.import_links(args)
     if type(args) ~= "table" or type(args.text) ~= "string" then
         return { code = -1, error = "请输入订阅链接或节点分享链接" }
@@ -944,8 +965,10 @@ function M.import_links(args)
         return { code = -1, error = "内容不能为空" }
     end
 
+    local sub_url = nil
     -- If input is a single HTTP/HTTPS subscription URL, fetch it non-blockingly via ngx.pipe.spawn
     if input:match("^https?://[^%s]+$") then
+        sub_url = input
         local body = spawn_read({
             "curl", "-fsSL", "--connect-timeout", "10", "-m", "20", "-A", "v2rayN/6.45", input
         }, 22000)
@@ -976,40 +999,76 @@ function M.import_links(args)
     end
 
     local c = uci.cursor()
-    local deleted_map = {}
+    local gen_id, gen = get_general_section(c)
+    if sub_url then
+        c:set("xray_core", gen_id, "subscription_url", sub_url)
+    end
+
+    local prev_pool_aliases = {}
     if args.replace_all then
+        local id_to_alias = {}
         local to_del = {}
+        local deleted_map = {}
         c:foreach("xray_core", "servers", function(s)
             local sid = s[".name"]
             to_del[#to_del + 1] = sid
             deleted_map[sid] = true
+            if s.alias and s.alias ~= "" then
+                id_to_alias[sid] = s.alias
+            end
         end)
+        for _, pk in ipairs({ "tcp_balancer_v4", "udp_balancer_v4", "tcp_balancer_v6", "udp_balancer_v6" }) do
+            local pool = gen[pk]
+            if type(pool) == "string" then pool = { pool } end
+            if type(pool) == "table" then
+                local aliases = {}
+                for _, id in ipairs(pool) do
+                    if id_to_alias[id] then aliases[#aliases + 1] = id_to_alias[id] end
+                end
+                prev_pool_aliases[pk] = aliases
+            end
+        end
         for _, id in ipairs(to_del) do c:delete("xray_core", id) end
+        cleanup_deleted_server_refs(c, deleted_map)
     end
 
-    local first_new_id = nil
+    local first_any_id = nil
+    local first_valid_id = nil
+    local alias_to_new_id = {}
     for _, srv in ipairs(parsed_list) do
         local sec = next_server_id(c)
-        if not first_new_id then first_new_id = sec end
+        if not first_any_id then first_any_id = sec end
+        if not first_valid_id and not is_fake_info_server(srv) then
+            first_valid_id = sec
+        end
+        if srv.alias and srv.alias ~= "" and not alias_to_new_id[srv.alias] then
+            alias_to_new_id[srv.alias] = sec
+        end
         c:set("xray_core", sec, "servers")
         apply_uci_fields(c, "xray_core", sec, srv)
     end
 
-    if args.replace_all and first_new_id then
-        cleanup_deleted_server_refs(c, deleted_map)
-        local gen_id, gen = get_general_section(c)
-        if not gen.tcp_balancer_v4 or #gen.tcp_balancer_v4 == 0 then
-            c:set("xray_core", gen_id, "tcp_balancer_v4", { first_new_id })
-        end
-        if not gen.udp_balancer_v4 or #gen.udp_balancer_v4 == 0 then
-            c:set("xray_core", gen_id, "udp_balancer_v4", { first_new_id })
+    local fallback_id = first_valid_id or first_any_id
+    if args.replace_all and fallback_id then
+        for _, pk in ipairs({ "tcp_balancer_v4", "udp_balancer_v4", "tcp_balancer_v6", "udp_balancer_v6" }) do
+            local restored = {}
+            for _, al in ipairs(prev_pool_aliases[pk] or {}) do
+                if alias_to_new_id[al] then
+                    restored[#restored + 1] = alias_to_new_id[al]
+                end
+            end
+            if #restored > 0 then
+                c:set("xray_core", gen_id, pk, restored)
+            elseif pk == "tcp_balancer_v4" or pk == "udp_balancer_v4" then
+                c:set("xray_core", gen_id, pk, { fallback_id })
+            end
         end
     end
 
     c:commit("xray_core")
     if args.replace_all then
-        local _, gen = get_general_section(c)
-        local _, proc_alive = get_xray_status(gen)
+        local _, cur_gen = get_general_section(c)
+        local _, proc_alive = get_xray_status(cur_gen)
         if proc_alive then
             service_exec("restart")
         end
@@ -1017,14 +1076,10 @@ function M.import_links(args)
     return { code = 0, data = { added = #parsed_list } }
 end
 
--- 7. Generic subsection CRUD (lan_hosts, extra_inbound, fakedns, manual_tproxy, bridge)
+-- 7. Generic subsection CRUD (lan_hosts, extra_inbound)
 local allowed_sub_types = {
     lan_hosts = true,
-    extra_inbound = true,
-    fakedns = true,
-    manual_tproxy = true,
-    bridge = true,
-    fallback = true
+    extra_inbound = true
 }
 
 function M.save_subsection(args)
@@ -1116,6 +1171,11 @@ end
 
 -- 11. Online update GeoIP / GeoSite from Loyalsoldier/v2ray-rules-dat (with domestic mirror & CDN fallback)
 function M.update_geodata()
+    local sf = io.open("/tmp/xray_geo_update.status", "w")
+    if sf then
+        sf:write("updating\n")
+        sf:close()
+    end
     local script = [[
 mkdir -p /usr/share/xray
 dl() {
@@ -1138,9 +1198,11 @@ dl() {
 if dl "geoip.dat" "/tmp/geoip.dat.new" && dl "geosite.dat" "/tmp/geosite.dat.new"; then
     mv /tmp/geoip.dat.new /usr/share/xray/geoip.dat
     mv /tmp/geosite.dat.new /usr/share/xray/geosite.dat
+    echo "ok" > /tmp/xray_geo_update.status
     /etc/init.d/xray_core restart
 else
     rm -f /tmp/geoip.dat.new /tmp/geosite.dat.new
+    echo "err" > /tmp/xray_geo_update.status
 fi
 ]]
     spawn_read({ "/bin/sh", "-c", "(" .. script .. ") >/tmp/xray_geo_update.log 2>&1 &" }, 2000)
