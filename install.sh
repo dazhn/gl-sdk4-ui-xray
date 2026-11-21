@@ -2055,8 +2055,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         var self = this;
         self.saving = true;
         callRpc("service_ctl", { action: action }, 35000).then(function () {
-          self.showToast("服务操作已完成: " + action);
-          return self.loadAll();
+          self.showToast(action === "stop" ? "已停止 Xray 并卸载 nftables / dnsmasq 转发规则" : ("服务操作已完成: " + action));
+          return self.loadAll(true);
         }).catch(function (e) {
           self.showToast("操作失败: " + e.message);
         }).finally(function () {
@@ -2208,14 +2208,30 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
       // Top status bar
       var m = self.metrics;
       var statusBadgeClass = "err";
-      var statusLabel = "○ Xray 已停止";
+      var statusLabel = self.tproxy_enabled ? "○ Xray 已停止 (点击卸载转发规则)" : "○ Xray 已停止";
       if (self.proc_running) {
         statusBadgeClass = self.tproxy_enabled ? "ok" : "warn";
         statusLabel = (self.tproxy_enabled ? "● Xray 透明代理运行中" : "◐ 仅核心运行 (TProxy 未挂载)") + (m && m.mem_mb ? " (" + m.mem_mb + ")" : "");
       }
       var topBar = h("div", { class: "xgl-topbar" }, [
         h("div", { class: "xgl-status-group" }, [
-          h("span", { class: "xgl-badge " + statusBadgeClass }, statusLabel),
+          h("span", {
+            class: "xgl-badge " + statusBadgeClass,
+            style: (!self.proc_running || self.tproxy_enabled) ? { cursor: "pointer", userSelect: "none" } : null,
+            attrs: {
+              title: !self.proc_running
+                ? "点击直接卸载残留的 nftables / dnsmasq 转发规则"
+                : "点击停止 Xray 并卸载 nftables / dnsmasq 转发规则"
+            },
+            on: {
+              click: function () {
+                if (self.saving) return;
+                if (!self.proc_running || confirm("确定要停止 Xray 并卸载 nftables / dnsmasq 转发规则吗？")) {
+                  self.controlService("stop");
+                }
+              }
+            }
+          }, statusLabel),
           m ? h("span", { class: "xgl-badge ok" }, "代理流量: ↓" + fmtBytes(m.proxy_down) + " / ↑" + fmtBytes(m.proxy_up)) : null,
           m ? h("span", { class: "xgl-badge info" }, "直连流量: ↓" + fmtBytes(m.direct_down) + " / ↑" + fmtBytes(m.direct_up)) : null,
           (m && m.direct_delay != null) ? h("span", { class: "xgl-badge " + (m.direct_delay > 0 ? "ok" : "err") },
