@@ -5,7 +5,7 @@
     styleEl.textContent = [
       ".xgl-wrap { padding: 8px 0 36px; font-size: 14px; line-height: 1.5; }",
       ".xgl-topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; border-radius: 10px; background: rgba(128,128,128,0.08); margin-bottom: 14px; border: 1px solid rgba(140,140,140,0.18); }",
-      ".xgl-dirty-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 16px; border-radius: 8px; background: rgba(243, 156, 18, 0.14); border: 1px solid rgba(243, 156, 18, 0.4); margin-bottom: 14px; font-size: 13px; }",
+      ".xgl-dirty-bar { position: sticky; top: 8px; z-index: 100; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 16px; border-radius: 8px; background: rgba(243, 156, 18, 0.22); backdrop-filter: blur(8px); border: 1px solid rgba(243, 156, 18, 0.55); box-shadow: 0 4px 14px rgba(0,0,0,0.14); margin-bottom: 14px; font-size: 13px; }",
       ".xgl-status-group { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }",
       ".xgl-badge { display: inline-flex; align-items: center; padding: 4px 11px; border-radius: 999px; font-size: 12px; font-weight: 600; }",
       ".xgl-badge.ok { background: rgba(46, 204, 113, 0.16); color: #27ae60; }",
@@ -440,6 +440,10 @@
 
       saveAllGeneral: function () {
         var self = this;
+        if (self.gen.transparent_proxy_enable === "1" && (self.tcpNodesV4.length === 0 || self.udpNodesV4.length === 0)) {
+          self.showToast("启用透明代理时，IPv4 TCP 与 UDP 节点池至少需选择 1 个节点");
+          return Promise.resolve();
+        }
         self.saving = true;
         var payload = self.buildGeneralPayload();
         return callRpc("save_general", { values: payload, apply: true }, 35000).then(function () {
@@ -560,6 +564,7 @@
           arr.push(srvId);
         }
         this[poolKey] = arr;
+        this.showToast("已更新节点池，请点击“立即保存并应用”生效");
       },
 
       toggleFamilyPool: function (tcpKey, udpKey, srvId) {
@@ -575,6 +580,7 @@
           this[tcpKey] = tcpArr;
           this[udpKey] = udpArr;
         }
+        this.showToast("已更新节点池，请点击“立即保存并应用”生效");
       },
 
       openEditServer: function (srv) {
@@ -669,6 +675,8 @@
         if (p === "hysteria") {
           ed.transport = "hysteria";
           if (ed.tls_mode !== "tls") ed.tls_mode = "tls";
+        } else if (p !== "vless" && ed.tls_mode === "reality") {
+          ed.tls_mode = p === "trojan" ? "tls" : "none";
         }
         var vals = {
           alias: ed.alias || (ed.server + ":" + ed.port),
@@ -703,6 +711,14 @@
           hysteria_udphop_port: (ed.transport === "hysteria" || p === "hysteria") ? ed.hysteria_udphop_port : ""
         };
         if (!ed.id && ed.transport === "tcp") vals.tcp_guise = "none";
+        ["shadowsocks", "vmess", "vless", "trojan", "hysteria", "socks", "http"].forEach(function (proto) {
+          if (proto !== p) {
+            vals[proto + "_tls"] = "";
+            vals[proto + "_tls_host"] = "";
+            vals[proto + "_tls_insecure"] = "";
+            vals[proto + "_tls_fingerprint"] = "";
+          }
+        });
         vals[p + "_tls"] = ed.tls_mode;
         if (ed.tls_mode === "tls") {
           vals[p + "_tls_host"] = ed.tls_host;
@@ -965,7 +981,12 @@
             h("button", {
               class: "xgl-btn sm",
               style: { padding: "2px 8px", fontSize: "11px" },
-              on: { click: function () { self[poolKey] = []; } }
+              on: {
+                click: function () {
+                  self[poolKey] = [];
+                  self.showToast("已清空该节点池，请点击“立即保存并应用”生效");
+                }
+              }
             }, "清空")
           ]) : [
             h("span", { class: "xgl-desc" }, "未添加节点（请在下方节点列表中点击 ⚡ 设为主用 或 +IPv4池）")
@@ -1001,7 +1022,7 @@
             class: "xgl-btn sm " + (self.proc_running ? "danger" : "success"),
             attrs: { disabled: self.saving },
             on: { click: function () { self.controlService(self.proc_running ? "stop" : "start"); } }
-          }, self.proc_running ? "⏹ 停止" : "▶ 启动")
+          }, self.proc_running ? "⏹ 停止服务" : "▶ 启动服务")
         ])
       ]);
 
@@ -1499,8 +1520,13 @@
               if (val === "hysteria") {
                 self.$set(ed, "transport", "hysteria");
                 self.$set(ed, "tls_mode", "tls");
-              } else if (ed.transport === "hysteria") {
-                self.$set(ed, "transport", "tcp");
+              } else {
+                if (ed.transport === "hysteria") {
+                  self.$set(ed, "transport", "tcp");
+                }
+                if (val !== "vless" && ed.tls_mode === "reality") {
+                  self.$set(ed, "tls_mode", val === "trojan" ? "tls" : "none");
+                }
               }
             })),
             row("密码 / UUID (Password / UserId)", "VMess/VLESS 填 UUID；SS/Trojan/Hysteria2 填密码", textInput(ed, "password", "UUID 或密码")),
@@ -1557,11 +1583,13 @@
               row("Hysteria2 端口跳跃范围 (UDP Hop Port)", "例如 20000-50000（留空则不启用端口跳跃）", textInput(ed, "hysteria_udphop_port", "20000-50000"))
             ]) : null,
 
-            row("传输层加密 (Stream Security)", "VLESS 支持 REALITY 与 TLS；Hysteria2 强制 TLS", selectInput(ed, "tls_mode", [
-              ["none", "none (不启用 TLS)"],
-              ["tls", "tls (标准 TLS)"],
-              ["reality", "reality (VLESS REALITY)"]
-            ])),
+            row("传输层加密 (Stream Security)", "VLESS 支持 REALITY 与 TLS；Hysteria2 强制 TLS", selectInput(ed, "tls_mode",
+              ed.protocol === "hysteria"
+                ? [["tls", "tls (标准 TLS)"]]
+                : (ed.protocol === "vless"
+                  ? [["none", "none (不启用 TLS)"], ["tls", "tls (标准 TLS)"], ["reality", "reality (VLESS REALITY)"]]
+                  : [["none", "none (不启用 TLS)"], ["tls", "tls (标准 TLS)"]])
+            )),
 
             (ed.protocol === "vless" && (ed.tls_mode === "tls" || ed.tls_mode === "reality")) ? row("VLESS XTLS 流控 (Flow)", "REALITY / TLS 直连推荐 xtls-rprx-vision", selectInput(ed, "flow_mode", [
               ["none", "none"],
