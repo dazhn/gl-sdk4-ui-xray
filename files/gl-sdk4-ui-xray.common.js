@@ -512,7 +512,7 @@
           this.$set(this.gen, "direct_bittorrent", "1");
           this.$set(this.gen, "routing_domain_strategy", "IPIfNonMatch");
           this.$set(this.gen, "custom_configuration_hook", BLACKLIST_HOOK_SCRIPT);
-          this.showToast("已填入【黑名单模式 (参考 v2rayN)】，点击“保存并应用”生效");
+          this.showToast("已填入【黑名单模式】规则，点击“保存并应用”生效");
         } else if (preset === "global") {
           this.bypassedRulesText = "geosite:private";
           this.forwardedRulesText = "geosite:geolocation-!cn";
@@ -1084,7 +1084,7 @@
       var currentPreset = self.detectRoutingPreset();
       var presetLabelMap = {
         bypass_cn: "当前模式：绕过中国大陆",
-        blacklist: "当前模式：黑名单模式 (v2rayN)",
+        blacklist: "当前模式：黑名单模式",
         global: "当前模式：全局代理",
         custom: "当前模式：自定义规则"
       };
@@ -1103,9 +1103,9 @@
             }, "绕过中国大陆"),
             h("button", {
               class: "xgl-btn sm " + (currentPreset === "blacklist" ? "success" : ""),
-              attrs: { title: "参考本地 v2rayN V4-黑名单(Blacklist)：仅 GFW/海外常用服务走代理，其余默认直连并阻断 UDP 443" },
+              attrs: { title: "仅 GFW / 海外常用服务走代理，其余默认直连并阻断 UDP 443" },
               on: { click: function () { self.applyRoutingPreset("blacklist"); } }
-            }, "黑名单模式 (v2rayN)"),
+            }, "黑名单模式"),
             h("button", {
               class: "xgl-btn sm " + (currentPreset === "global" ? "success" : ""),
               on: { click: function () { self.applyRoutingPreset("global"); } }
