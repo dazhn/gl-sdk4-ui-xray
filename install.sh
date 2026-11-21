@@ -2214,7 +2214,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         statusLabel = (self.tproxy_enabled ? "● Xray 透明代理运行中" : "◐ 仅核心运行 (TProxy 未挂载)") + (m && m.mem_mb ? " (" + m.mem_mb + ")" : "");
       }
       var topBar = h("div", { class: "xgl-topbar" }, [
-        h("div", { class: "xgl-status-group" }, [
+        h("div", { class: "xgl-status-group", style: { flex: "1", minWidth: "240px" } }, [
           h("span", {
             class: "xgl-badge " + statusBadgeClass,
             style: !self.proc_running ? { cursor: "pointer", userSelect: "none" } : null,
@@ -2241,7 +2241,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           self.cnPing ? h("span", { class: "xgl-badge " + (self.cnPing.ok ? "ok" : "err") }, "国内测速: " + (self.cnPing.ok ? self.cnPing.latency_ms + "ms" : "不通")) : null,
           self.googlePing ? h("span", { class: "xgl-badge " + (self.googlePing.ok ? "ok" : "err") }, "Google测速: " + (self.googlePing.ok ? self.googlePing.latency_ms + "ms" : "不通")) : null
         ]),
-        h("div", { class: "xgl-status-group" }, [
+        h("div", { class: "xgl-status-group", style: { marginLeft: "auto", flexShrink: "0", justifyContent: "flex-end" } }, [
           h("button", { class: "xgl-btn sm", attrs: { disabled: self.testing }, on: { click: self.runPingTest } }, self.testing ? "测速中..." : "⚡ 连通性测速"),
           h("button", { class: "xgl-btn sm", attrs: { disabled: self.saving }, on: { click: function () { self.controlService("restart"); } } }, "🔄 重启服务"),
           h("button", {
