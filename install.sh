@@ -1472,7 +1472,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
       self.loadAll();
       self.metricsTimer = setInterval(function () {
         if (typeof document !== "undefined" && document.hidden) return;
-        if (!self.updatingGeo && (!self.proc_running || self.gen.metrics_server_enable !== "1")) return;
+        if (!self.updatingGeo && !self.proc_running && !self.tproxy_enabled) return;
         self.refreshMetrics();
       }, 5000);
       self._onKeyDown = function (e) {
@@ -1481,7 +1481,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         }
       };
       self._onVisChange = function () {
-        if (typeof document !== "undefined" && !document.hidden && self.proc_running && self.gen.metrics_server_enable === "1") {
+        if (typeof document !== "undefined" && !document.hidden && (self.proc_running || self.tproxy_enabled || self.updatingGeo)) {
           self.refreshMetrics();
         }
       };
@@ -2217,16 +2217,15 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         h("div", { class: "xgl-status-group" }, [
           h("span", {
             class: "xgl-badge " + statusBadgeClass,
-            style: (!self.proc_running || self.tproxy_enabled) ? { cursor: "pointer", userSelect: "none" } : null,
+            style: !self.proc_running ? { cursor: "pointer", userSelect: "none" } : null,
             attrs: {
               title: !self.proc_running
                 ? "点击直接卸载残留的 nftables / dnsmasq 转发规则"
-                : "点击停止 Xray 并卸载 nftables / dnsmasq 转发规则"
+                : ""
             },
             on: {
               click: function () {
-                if (self.saving) return;
-                if (!self.proc_running || confirm("确定要停止 Xray 并卸载 nftables / dnsmasq 转发规则吗？")) {
+                if (!self.proc_running && !self.saving) {
                   self.controlService("stop");
                 }
               }

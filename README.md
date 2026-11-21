@@ -52,7 +52,7 @@ sh /root/install-xray-gl.sh --uninstall
 | :--- | :--- | :--- |
 | `install.sh` | `/root/install-xray-gl.sh` | **单文件自包含安装/卸载脚本**（内嵌以下全部文件，下载单个 `.sh` 即可独立运行） |
 | `files/menu.json` | `/usr/share/oui/menu.d/xray.json` | GL.iNet 左侧导航栏菜单注册配置（`index: 15`，兼容简体/繁体中文） |
-| `files/validator.lua` | `/usr/share/gl-validator.d/xray.lua` | `oui-rpc` 参数校验白名单（13 个 RPC 方法） |
+| `files/validator.lua` | `/usr/share/gl-validator.d/xray.lua` | `oui-rpc` 参数校验白名单（12 个 RPC 方法） |
 | `files/rpc_xray.lua` | `/usr/lib/oui-httpd/rpc/xray` | Lua 5.1 后端 RPC 引擎（UCI 读写、订阅解析、Metrics 采集、非阻塞服务控制） |
 | `files/gl-sdk4-ui-xray.common.js` | `/www/views/gl-sdk4-ui-xray.common.js(.gz)` | 前端 Vue 2 视图包（自动 Gzip 预压缩，适配 Nginx `gzip_static`） |
 | `PROGRESS.md` | - | 项目阶段里程碑、架构重构与验证记录文档 |
