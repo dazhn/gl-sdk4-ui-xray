@@ -41,9 +41,9 @@ local function spawn_read(cmd, timeout_ms)
             stdout_read_timeout = timeout_ms or 10000
         })
         if ok and proc then
-            local out, _, partial = proc:stdout_read_all()
+            local out = proc:stdout_read_all() or ""
             pcall(function() proc:wait() end)
-            return out or partial or ""
+            return out
         end
     end
     local cmd_str
@@ -60,6 +60,13 @@ local function spawn_read(cmd, timeout_ms)
     local out = f and f:read("*a") or ""
     if f then f:close() end
     return out
+end
+
+local function safe_str(v, fallback)
+    if v == nil or v == cjson.null or type(v) == "table" then
+        return fallback or ""
+    end
+    return tostring(v)
 end
 
 -- Synchronous (non-blocking coroutine wait) service control via ngx.pipe.spawn
@@ -178,11 +185,6 @@ local function get_xray_status(gen)
     return running, proc_alive, tproxy_active
 end
 
-local function is_xray_running(gen)
-    local running = get_xray_status(gen)
-    return running
-end
-
 local function apply_uci_fields(c, pkg, sec, values)
     for k, v in pairs(values) do
         if type(k) == "string" and not k:match("^%.") and k:match("^[%w_]+$") then
@@ -294,7 +296,7 @@ local function fetch_metrics_summary(port)
                 if tag == "direct" then
                     direct_delay = info.alive and tonumber(info.delay) or -1
                 else
-                    local srv_id = tag:match(":(srv_%d+)$")
+                    local srv_id = tag:match(":([^:]+)$")
                     if srv_id then
                         nodes[srv_id] = nodes[srv_id] or { alive = false, delay = 0, up = 0, down = 0 }
                         if info.alive then
@@ -322,7 +324,7 @@ local function fetch_metrics_summary(port)
                     direct_up = direct_up + up
                     direct_down = direct_down + down
                 else
-                    local srv_id = tag:match(":(srv_%d+)$")
+                    local srv_id = tag:match(":([^:]+)$")
                     if srv_id then
                         proxy_up = proxy_up + up
                         proxy_down = proxy_down + down
@@ -359,7 +361,7 @@ function M.get_all()
         return (a[".index"] or 0) < (b[".index"] or 0)
     end)
 
-    local sub_types = { "lan_hosts", "extra_inbound", "fakedns", "manual_tproxy", "bridge", "fallback" }
+    local sub_types = { "lan_hosts", "extra_inbound" }
     local subsections = {}
     for _, st in ipairs(sub_types) do
         local list = {}
@@ -428,6 +430,71 @@ function M.save_general(args)
     return { code = 0, data = { ok = true } }
 end
 
+local BLACKLIST_HOOK = [[// __GL_XRAY_PRESET_BLACKLIST__
+return function(config) {
+    let new_rules = [];
+    let fallback_rules = [];
+
+    // 1. Block UDP 443 (QUIC) matching v2rayN Blacklist preset
+    push(new_rules, {
+        type: "field",
+        port: "443",
+        network: "udp",
+        outboundTag: "blackhole_outbound"
+    });
+
+    // 2. Rewrite unconditional catch-all proxy rules to direct
+    for (let r in config.routing.rules) {
+        if (r.domain == null && r.ip == null && (
+            r.balancerTag == "tcp_outbound_v4" ||
+            r.balancerTag == "udp_outbound_v4" ||
+            r.balancerTag == "tcp_outbound_v6" ||
+            r.balancerTag == "udp_outbound_v6"
+        )) {
+            if (r.balancerTag == "tcp_outbound_v4" || r.balancerTag == "udp_outbound_v4") {
+                push(new_rules, {
+                    type: "field",
+                    inboundTag: r.inboundTag,
+                    ip: [
+                        "geoip:facebook", "geoip:fastly", "geoip:google",
+                        "geoip:netflix", "geoip:telegram", "geoip:twitter",
+                        "1.1.1.1", "1.0.0.1", "1.1.1.2", "1.0.0.2", "1.1.1.3", "1.0.0.3",
+                        "8.8.8.8", "8.8.4.4", "94.140.14.14", "94.140.15.15",
+                        "208.67.222.222", "208.67.220.220", "9.9.9.9", "149.112.112.112",
+                        "77.88.8.8", "77.88.8.1"
+                    ],
+                    balancerTag: r.balancerTag
+                });
+            }
+            push(fallback_rules, {
+                type: "field",
+                inboundTag: r.inboundTag,
+                outboundTag: "direct"
+            });
+        } else {
+            push(new_rules, r);
+        }
+    }
+
+    for (let fb in fallback_rules) {
+        push(new_rules, fb);
+    }
+    config.routing.rules = new_rules;
+    return config;
+};]]
+
+local function filter_valid_servers(c, list)
+    local out = {}
+    if type(list) == "string" then list = { list } end
+    if type(list) ~= "table" then return out end
+    for _, id in ipairs(list) do
+        if type(id) == "string" and id ~= "" and c:get("xray_core", id) == "servers" then
+            out[#out + 1] = id
+        end
+    end
+    return out
+end
+
 -- 3. Quick switch active TCP/UDP node & mode
 function M.switch_node(args)
     if type(args) ~= "table" then
@@ -439,17 +506,21 @@ function M.switch_node(args)
     if args.enabled ~= nil then
         c:set("xray_core", gen_id, "transparent_proxy_enable", args.enabled and "1" or "0")
     end
-    if type(args.tcp_node) == "string" and args.tcp_node ~= "" then
-        c:set("xray_core", gen_id, "tcp_balancer_v4", { args.tcp_node })
-    elseif type(args.tcp_nodes) == "table" and #args.tcp_nodes > 0 then
-        c:set("xray_core", gen_id, "tcp_balancer_v4", args.tcp_nodes)
-    end
-    if type(args.udp_node) == "string" and args.udp_node ~= "" then
-        c:set("xray_core", gen_id, "udp_balancer_v4", { args.udp_node })
-    elseif type(args.udp_nodes) == "table" and #args.udp_nodes > 0 then
-        c:set("xray_core", gen_id, "udp_balancer_v4", args.udp_nodes)
+    local tcp_list = filter_valid_servers(c, args.tcp_nodes or args.tcp_node)
+    if (args.tcp_nodes or args.tcp_node) and #tcp_list == 0 then
+        return { code = -1, error = "指定的 TCP 节点不存在" }
+    elseif #tcp_list > 0 then
+        c:set("xray_core", gen_id, "tcp_balancer_v4", tcp_list)
     end
 
+    local udp_list = filter_valid_servers(c, args.udp_nodes or args.udp_node)
+    if (args.udp_nodes or args.udp_node) and #udp_list == 0 then
+        return { code = -1, error = "指定的 UDP 节点不存在" }
+    elseif #udp_list > 0 then
+        c:set("xray_core", gen_id, "udp_balancer_v4", udp_list)
+    end
+
+    local cur_hook = type(gen.custom_configuration_hook) == "string" and gen.custom_configuration_hook or ""
     if args.preset == "bypass_cn" then
         local bp = type(gen.bypassed_domain_rules) == "table" and gen.bypassed_domain_rules or {}
         local found = false
@@ -458,6 +529,27 @@ function M.switch_node(args)
         c:set("xray_core", gen_id, "bypassed_domain_rules", bp)
         c:set("xray_core", gen_id, "geoip_direct_code_list", { "cn" })
         c:set("xray_core", gen_id, "geoip_direct_code_list_v6", { "cn" })
+        c:set("xray_core", gen_id, "default_dns", "1.1.1.1:53")
+        if cur_hook:find("__GL_XRAY_PRESET_BLACKLIST__", 1, true) then
+            c:delete("xray_core", gen_id, "custom_configuration_hook")
+        end
+    elseif args.preset == "blacklist" then
+        c:set("xray_core", gen_id, "bypassed_domain_rules", { "geosite:private", "geosite:cn" })
+        c:set("xray_core", gen_id, "forwarded_domain_rules", {
+            "geosite:gfw", "geosite:greatfire", "geosite:google", "domain:api.ip.sb",
+            "domain:cloudflare-dns.com", "domain:one.one.one.one", "domain:dns.google",
+            "domain:adguard-dns.com", "domain:opendns.com", "domain:umbrella.com",
+            "domain:quad9.net", "domain:yandex.net"
+        })
+        c:delete("xray_core", gen_id, "geoip_direct_code_list")
+        c:delete("xray_core", gen_id, "geoip_direct_code_list_v6")
+        c:set("xray_core", gen_id, "fast_dns", "223.5.5.5:53")
+        c:set("xray_core", gen_id, "secure_dns", "1.1.1.1:53")
+        c:set("xray_core", gen_id, "default_dns", "223.5.5.5:53")
+        c:set("xray_core", gen_id, "tproxy_sniffing", "1")
+        c:set("xray_core", gen_id, "route_only", "1")
+        c:set("xray_core", gen_id, "direct_bittorrent", "1")
+        c:set("xray_core", gen_id, "custom_configuration_hook", BLACKLIST_HOOK)
     elseif args.preset == "global" then
         local bp = {}
         if type(gen.bypassed_domain_rules) == "table" then
@@ -472,6 +564,10 @@ function M.switch_node(args)
         end
         c:delete("xray_core", gen_id, "geoip_direct_code_list")
         c:delete("xray_core", gen_id, "geoip_direct_code_list_v6")
+        c:set("xray_core", gen_id, "default_dns", "1.1.1.1:53")
+        if cur_hook:find("__GL_XRAY_PRESET_BLACKLIST__", 1, true) then
+            c:delete("xray_core", gen_id, "custom_configuration_hook")
+        end
     end
 
     c:commit("xray_core")
@@ -590,62 +686,84 @@ local function parse_host_port(hp)
     return host, port, hop_port, url_path
 end
 
+local function split_uri_parts(rest)
+    local alias = ""
+    local hash_pos = rest:find("#", 1, true)
+    if hash_pos then
+        alias = url_decode(rest:sub(hash_pos + 1))
+        rest = rest:sub(1, hash_pos - 1)
+    end
+    local qs = ""
+    local q_pos = rest:find("?", 1, true)
+    if q_pos then
+        qs = rest:sub(q_pos + 1)
+        rest = rest:sub(1, q_pos - 1)
+    end
+    return rest, alias, qs
+end
+
 local function parse_single_uri(line)
     line = trim(line)
     if line == "" then return nil end
 
     -- 1. vmess:// (base64 JSON, with optional #remark suffix)
     if line:match("^vmess://") then
-        local rest = line:sub(9)
-        local hash_alias = nil
-        local hash_pos = rest:find("#", 1, true)
-        if hash_pos then
-            hash_alias = url_decode(rest:sub(hash_pos + 1))
-            rest = rest:sub(1, hash_pos - 1)
-        end
+        local rest, hash_alias = split_uri_parts(line:sub(9))
         local raw = base64_decode(rest)
         local ok, j = pcall(cjson.decode, raw)
-        if ok and type(j) == "table" and j.add and j.port then
-            local net = j.net or "tcp"
+        local j_add = ok and type(j) == "table" and safe_str(j.add) or ""
+        local j_port = ok and type(j) == "table" and safe_str(j.port) or ""
+        if j_add ~= "" and j_port ~= "" then
+            local net = safe_str(j.net, "tcp")
+            if net == "" then net = "tcp" end
             if net == "xhttp" then net = "splithttp" end
-            local tls_mode = (j.tls == "tls" or j.tls == "1") and "tls" or "none"
-            local alias_val = (j.ps and tostring(j.ps) ~= "" and tostring(j.ps))
-                or (hash_alias and hash_alias ~= "" and hash_alias)
-                or (tostring(j.add) .. ":" .. tostring(j.port))
+            local j_tls = safe_str(j.tls)
+            local tls_mode = (j_tls == "tls" or j_tls == "1") and "tls" or "none"
+            local j_ps = safe_str(j.ps)
+            local j_host = safe_str(j.host)
+            local j_path = safe_str(j.path)
+            local j_sni = safe_str(j.sni)
+            local j_aid = safe_str(j.aid, "0")
+            if j_aid == "" then j_aid = "0" end
+            local alias_val = (j_ps ~= "" and j_ps)
+                or (hash_alias ~= "" and hash_alias)
+                or (j_add .. ":" .. j_port)
             local srv = {
                 alias = alias_val,
-                server = tostring(j.add),
-                server_port = { tostring(j.port) },
-                password = tostring(j.id or ""),
+                server = j_add,
+                server_port = { j_port },
+                password = safe_str(j.id),
                 protocol = "vmess",
-                vmess_security = tostring(j.scy or "auto"),
-                vmess_alter_id = tostring(j.aid or "0"),
-                alter_id = tostring(j.aid or "0"),
+                vmess_security = safe_str(j.scy, "auto"),
+                vmess_alter_id = j_aid,
+                alter_id = j_aid,
                 vmess_tls = tls_mode,
                 transport = net,
                 domain_strategy = "UseIP",
                 dialer_proxy = "disabled"
             }
+            if srv.vmess_security == "" then srv.vmess_security = "auto" end
             if net == "tcp" then
-                srv.tcp_guise = (j.type == "http") and "http" or "none"
-                if j.host and j.host ~= "" then srv.http_host = { tostring(j.host) } end
-                if j.path and j.path ~= "" then srv.http_path = { tostring(j.path) } end
+                srv.tcp_guise = (safe_str(j.type) == "http") and "http" or "none"
+                if j_host ~= "" then srv.http_host = { j_host } end
+                if j_path ~= "" then srv.http_path = { j_path } end
             elseif net == "ws" then
-                srv.ws_host = tostring(j.host or "")
-                srv.ws_path = tostring(j.path or "/")
+                srv.ws_host = j_host
+                srv.ws_path = j_path ~= "" and j_path or "/"
             elseif net == "grpc" then
-                srv.grpc_service_name = tostring(j.path or "")
+                srv.grpc_service_name = j_path
             elseif net == "splithttp" then
-                srv.splithttp_host = tostring(j.host or "")
-                srv.splithttp_path = tostring(j.path or "/")
+                srv.splithttp_host = j_host
+                srv.splithttp_path = j_path ~= "" and j_path or "/"
             elseif net == "httpupgrade" then
-                srv.httpupgrade_host = tostring(j.host or "")
-                srv.httpupgrade_path = tostring(j.path or "/")
+                srv.httpupgrade_host = j_host
+                srv.httpupgrade_path = j_path ~= "" and j_path or "/"
             end
             if tls_mode == "tls" then
-                srv.vmess_tls_host = tostring(j.sni or j.host or "")
-                srv.vmess_tls_insecure = (j.allowInsecure == true or j.allowInsecure == "1" or j.insecure == "1") and "1" or "0"
-                srv.vmess_tls_fingerprint = tostring(j.fp or "chrome")
+                srv.vmess_tls_host = j_sni ~= "" and j_sni or j_host
+                srv.vmess_tls_insecure = (j.allowInsecure == true or safe_str(j.allowInsecure) == "1" or safe_str(j.insecure) == "1") and "1" or "0"
+                srv.vmess_tls_fingerprint = safe_str(j.fp, "chrome")
+                if srv.vmess_tls_fingerprint == "" then srv.vmess_tls_fingerprint = "chrome" end
             end
             return srv
         end
@@ -654,15 +772,7 @@ local function parse_single_uri(line)
 
     -- 2. ss:// (SIP002 & legacy base64, IPv4 & IPv6 literal)
     if line:match("^ss://") then
-        local rest = line:sub(6)
-        local alias = ""
-        local hash_pos = rest:find("#", 1, true)
-        if hash_pos then
-            alias = url_decode(rest:sub(hash_pos + 1))
-            rest = rest:sub(1, hash_pos - 1)
-        end
-        local q_pos = rest:find("?", 1, true)
-        if q_pos then rest = rest:sub(1, q_pos - 1) end
+        local rest, alias = split_uri_parts(line:sub(6))
 
         local userinfo, hostport = rest:match("^([^@]+)@(.+)$")
         local method, pass, host, port
@@ -705,19 +815,7 @@ local function parse_single_uri(line)
     -- 3. hysteria2:// and hy2://
     local hy_prefix = line:match("^(hysteria2)://") or line:match("^(hy2)://")
     if hy_prefix then
-        local rest = line:sub(#hy_prefix + 4)
-        local alias = ""
-        local hash_pos = rest:find("#", 1, true)
-        if hash_pos then
-            alias = url_decode(rest:sub(hash_pos + 1))
-            rest = rest:sub(1, hash_pos - 1)
-        end
-        local qs = ""
-        local q_pos = rest:find("?", 1, true)
-        if q_pos then
-            qs = rest:sub(q_pos + 1)
-            rest = rest:sub(1, q_pos - 1)
-        end
+        local rest, alias, qs = split_uri_parts(line:sub(#hy_prefix + 4))
         local auth, hostport = rest:match("^([^@]+)@(.+)$")
         if not auth then
             auth = ""
@@ -746,9 +844,7 @@ local function parse_single_uri(line)
             hysteria_tls_host = q.sni or q.peer or "",
             hysteria_tls_insecure = insecure,
             hysteria_tls_fingerprint = q.fp or "chrome",
-            hysteria_up = up_val,
             hysteria_up_mbps = up_val,
-            hysteria_down = down_val,
             hysteria_down_mbps = down_val,
             hysteria_udphop_port = mport,
             domain_strategy = "UseIP",
@@ -759,19 +855,7 @@ local function parse_single_uri(line)
     -- 4. vless:// and trojan://
     local proto = line:match("^(vless)://") or line:match("^(trojan)://")
     if proto then
-        local rest = line:sub(#proto + 4)
-        local alias = ""
-        local hash_pos = rest:find("#", 1, true)
-        if hash_pos then
-            alias = url_decode(rest:sub(hash_pos + 1))
-            rest = rest:sub(1, hash_pos - 1)
-        end
-        local qs = ""
-        local q_pos = rest:find("?", 1, true)
-        if q_pos then
-            qs = rest:sub(q_pos + 1)
-            rest = rest:sub(1, q_pos - 1)
-        end
+        local rest, alias, qs = split_uri_parts(line:sub(#proto + 4))
         local uuid, hostport = rest:match("^([^@]+)@(.+)$")
         if not uuid or not hostport then return nil end
         local host, port, _, url_path = parse_host_port(hostport)
@@ -808,7 +892,6 @@ local function parse_single_uri(line)
                 srv.vless_reality_public_key = q.pbk or ""
                 srv.vless_reality_short_id = q.sid or ""
                 srv.vless_reality_spider_x = q.spx or ""
-                srv.vless_spider_x = q.spx or ""
                 srv.vless_reality_fingerprint = q.fp or "chrome"
             end
         elseif proto == "trojan" then

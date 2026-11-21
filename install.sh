@@ -187,9 +187,9 @@ local function spawn_read(cmd, timeout_ms)
             stdout_read_timeout = timeout_ms or 10000
         })
         if ok and proc then
-            local out, _, partial = proc:stdout_read_all()
+            local out = proc:stdout_read_all() or ""
             pcall(function() proc:wait() end)
-            return out or partial or ""
+            return out
         end
     end
     local cmd_str
@@ -206,6 +206,13 @@ local function spawn_read(cmd, timeout_ms)
     local out = f and f:read("*a") or ""
     if f then f:close() end
     return out
+end
+
+local function safe_str(v, fallback)
+    if v == nil or v == cjson.null or type(v) == "table" then
+        return fallback or ""
+    end
+    return tostring(v)
 end
 
 -- Synchronous (non-blocking coroutine wait) service control via ngx.pipe.spawn
@@ -324,11 +331,6 @@ local function get_xray_status(gen)
     return running, proc_alive, tproxy_active
 end
 
-local function is_xray_running(gen)
-    local running = get_xray_status(gen)
-    return running
-end
-
 local function apply_uci_fields(c, pkg, sec, values)
     for k, v in pairs(values) do
         if type(k) == "string" and not k:match("^%.") and k:match("^[%w_]+$") then
@@ -440,7 +442,7 @@ local function fetch_metrics_summary(port)
                 if tag == "direct" then
                     direct_delay = info.alive and tonumber(info.delay) or -1
                 else
-                    local srv_id = tag:match(":(srv_%d+)$")
+                    local srv_id = tag:match(":([^:]+)$")
                     if srv_id then
                         nodes[srv_id] = nodes[srv_id] or { alive = false, delay = 0, up = 0, down = 0 }
                         if info.alive then
@@ -468,7 +470,7 @@ local function fetch_metrics_summary(port)
                     direct_up = direct_up + up
                     direct_down = direct_down + down
                 else
-                    local srv_id = tag:match(":(srv_%d+)$")
+                    local srv_id = tag:match(":([^:]+)$")
                     if srv_id then
                         proxy_up = proxy_up + up
                         proxy_down = proxy_down + down
@@ -505,7 +507,7 @@ function M.get_all()
         return (a[".index"] or 0) < (b[".index"] or 0)
     end)
 
-    local sub_types = { "lan_hosts", "extra_inbound", "fakedns", "manual_tproxy", "bridge", "fallback" }
+    local sub_types = { "lan_hosts", "extra_inbound" }
     local subsections = {}
     for _, st in ipairs(sub_types) do
         local list = {}
@@ -574,6 +576,71 @@ function M.save_general(args)
     return { code = 0, data = { ok = true } }
 end
 
+local BLACKLIST_HOOK = [[// __GL_XRAY_PRESET_BLACKLIST__
+return function(config) {
+    let new_rules = [];
+    let fallback_rules = [];
+
+    // 1. Block UDP 443 (QUIC) matching v2rayN Blacklist preset
+    push(new_rules, {
+        type: "field",
+        port: "443",
+        network: "udp",
+        outboundTag: "blackhole_outbound"
+    });
+
+    // 2. Rewrite unconditional catch-all proxy rules to direct
+    for (let r in config.routing.rules) {
+        if (r.domain == null && r.ip == null && (
+            r.balancerTag == "tcp_outbound_v4" ||
+            r.balancerTag == "udp_outbound_v4" ||
+            r.balancerTag == "tcp_outbound_v6" ||
+            r.balancerTag == "udp_outbound_v6"
+        )) {
+            if (r.balancerTag == "tcp_outbound_v4" || r.balancerTag == "udp_outbound_v4") {
+                push(new_rules, {
+                    type: "field",
+                    inboundTag: r.inboundTag,
+                    ip: [
+                        "geoip:facebook", "geoip:fastly", "geoip:google",
+                        "geoip:netflix", "geoip:telegram", "geoip:twitter",
+                        "1.1.1.1", "1.0.0.1", "1.1.1.2", "1.0.0.2", "1.1.1.3", "1.0.0.3",
+                        "8.8.8.8", "8.8.4.4", "94.140.14.14", "94.140.15.15",
+                        "208.67.222.222", "208.67.220.220", "9.9.9.9", "149.112.112.112",
+                        "77.88.8.8", "77.88.8.1"
+                    ],
+                    balancerTag: r.balancerTag
+                });
+            }
+            push(fallback_rules, {
+                type: "field",
+                inboundTag: r.inboundTag,
+                outboundTag: "direct"
+            });
+        } else {
+            push(new_rules, r);
+        }
+    }
+
+    for (let fb in fallback_rules) {
+        push(new_rules, fb);
+    }
+    config.routing.rules = new_rules;
+    return config;
+};]]
+
+local function filter_valid_servers(c, list)
+    local out = {}
+    if type(list) == "string" then list = { list } end
+    if type(list) ~= "table" then return out end
+    for _, id in ipairs(list) do
+        if type(id) == "string" and id ~= "" and c:get("xray_core", id) == "servers" then
+            out[#out + 1] = id
+        end
+    end
+    return out
+end
+
 -- 3. Quick switch active TCP/UDP node & mode
 function M.switch_node(args)
     if type(args) ~= "table" then
@@ -585,17 +652,21 @@ function M.switch_node(args)
     if args.enabled ~= nil then
         c:set("xray_core", gen_id, "transparent_proxy_enable", args.enabled and "1" or "0")
     end
-    if type(args.tcp_node) == "string" and args.tcp_node ~= "" then
-        c:set("xray_core", gen_id, "tcp_balancer_v4", { args.tcp_node })
-    elseif type(args.tcp_nodes) == "table" and #args.tcp_nodes > 0 then
-        c:set("xray_core", gen_id, "tcp_balancer_v4", args.tcp_nodes)
-    end
-    if type(args.udp_node) == "string" and args.udp_node ~= "" then
-        c:set("xray_core", gen_id, "udp_balancer_v4", { args.udp_node })
-    elseif type(args.udp_nodes) == "table" and #args.udp_nodes > 0 then
-        c:set("xray_core", gen_id, "udp_balancer_v4", args.udp_nodes)
+    local tcp_list = filter_valid_servers(c, args.tcp_nodes or args.tcp_node)
+    if (args.tcp_nodes or args.tcp_node) and #tcp_list == 0 then
+        return { code = -1, error = "指定的 TCP 节点不存在" }
+    elseif #tcp_list > 0 then
+        c:set("xray_core", gen_id, "tcp_balancer_v4", tcp_list)
     end
 
+    local udp_list = filter_valid_servers(c, args.udp_nodes or args.udp_node)
+    if (args.udp_nodes or args.udp_node) and #udp_list == 0 then
+        return { code = -1, error = "指定的 UDP 节点不存在" }
+    elseif #udp_list > 0 then
+        c:set("xray_core", gen_id, "udp_balancer_v4", udp_list)
+    end
+
+    local cur_hook = type(gen.custom_configuration_hook) == "string" and gen.custom_configuration_hook or ""
     if args.preset == "bypass_cn" then
         local bp = type(gen.bypassed_domain_rules) == "table" and gen.bypassed_domain_rules or {}
         local found = false
@@ -604,6 +675,27 @@ function M.switch_node(args)
         c:set("xray_core", gen_id, "bypassed_domain_rules", bp)
         c:set("xray_core", gen_id, "geoip_direct_code_list", { "cn" })
         c:set("xray_core", gen_id, "geoip_direct_code_list_v6", { "cn" })
+        c:set("xray_core", gen_id, "default_dns", "1.1.1.1:53")
+        if cur_hook:find("__GL_XRAY_PRESET_BLACKLIST__", 1, true) then
+            c:delete("xray_core", gen_id, "custom_configuration_hook")
+        end
+    elseif args.preset == "blacklist" then
+        c:set("xray_core", gen_id, "bypassed_domain_rules", { "geosite:private", "geosite:cn" })
+        c:set("xray_core", gen_id, "forwarded_domain_rules", {
+            "geosite:gfw", "geosite:greatfire", "geosite:google", "domain:api.ip.sb",
+            "domain:cloudflare-dns.com", "domain:one.one.one.one", "domain:dns.google",
+            "domain:adguard-dns.com", "domain:opendns.com", "domain:umbrella.com",
+            "domain:quad9.net", "domain:yandex.net"
+        })
+        c:delete("xray_core", gen_id, "geoip_direct_code_list")
+        c:delete("xray_core", gen_id, "geoip_direct_code_list_v6")
+        c:set("xray_core", gen_id, "fast_dns", "223.5.5.5:53")
+        c:set("xray_core", gen_id, "secure_dns", "1.1.1.1:53")
+        c:set("xray_core", gen_id, "default_dns", "223.5.5.5:53")
+        c:set("xray_core", gen_id, "tproxy_sniffing", "1")
+        c:set("xray_core", gen_id, "route_only", "1")
+        c:set("xray_core", gen_id, "direct_bittorrent", "1")
+        c:set("xray_core", gen_id, "custom_configuration_hook", BLACKLIST_HOOK)
     elseif args.preset == "global" then
         local bp = {}
         if type(gen.bypassed_domain_rules) == "table" then
@@ -618,6 +710,10 @@ function M.switch_node(args)
         end
         c:delete("xray_core", gen_id, "geoip_direct_code_list")
         c:delete("xray_core", gen_id, "geoip_direct_code_list_v6")
+        c:set("xray_core", gen_id, "default_dns", "1.1.1.1:53")
+        if cur_hook:find("__GL_XRAY_PRESET_BLACKLIST__", 1, true) then
+            c:delete("xray_core", gen_id, "custom_configuration_hook")
+        end
     end
 
     c:commit("xray_core")
@@ -736,62 +832,84 @@ local function parse_host_port(hp)
     return host, port, hop_port, url_path
 end
 
+local function split_uri_parts(rest)
+    local alias = ""
+    local hash_pos = rest:find("#", 1, true)
+    if hash_pos then
+        alias = url_decode(rest:sub(hash_pos + 1))
+        rest = rest:sub(1, hash_pos - 1)
+    end
+    local qs = ""
+    local q_pos = rest:find("?", 1, true)
+    if q_pos then
+        qs = rest:sub(q_pos + 1)
+        rest = rest:sub(1, q_pos - 1)
+    end
+    return rest, alias, qs
+end
+
 local function parse_single_uri(line)
     line = trim(line)
     if line == "" then return nil end
 
     -- 1. vmess:// (base64 JSON, with optional #remark suffix)
     if line:match("^vmess://") then
-        local rest = line:sub(9)
-        local hash_alias = nil
-        local hash_pos = rest:find("#", 1, true)
-        if hash_pos then
-            hash_alias = url_decode(rest:sub(hash_pos + 1))
-            rest = rest:sub(1, hash_pos - 1)
-        end
+        local rest, hash_alias = split_uri_parts(line:sub(9))
         local raw = base64_decode(rest)
         local ok, j = pcall(cjson.decode, raw)
-        if ok and type(j) == "table" and j.add and j.port then
-            local net = j.net or "tcp"
+        local j_add = ok and type(j) == "table" and safe_str(j.add) or ""
+        local j_port = ok and type(j) == "table" and safe_str(j.port) or ""
+        if j_add ~= "" and j_port ~= "" then
+            local net = safe_str(j.net, "tcp")
+            if net == "" then net = "tcp" end
             if net == "xhttp" then net = "splithttp" end
-            local tls_mode = (j.tls == "tls" or j.tls == "1") and "tls" or "none"
-            local alias_val = (j.ps and tostring(j.ps) ~= "" and tostring(j.ps))
-                or (hash_alias and hash_alias ~= "" and hash_alias)
-                or (tostring(j.add) .. ":" .. tostring(j.port))
+            local j_tls = safe_str(j.tls)
+            local tls_mode = (j_tls == "tls" or j_tls == "1") and "tls" or "none"
+            local j_ps = safe_str(j.ps)
+            local j_host = safe_str(j.host)
+            local j_path = safe_str(j.path)
+            local j_sni = safe_str(j.sni)
+            local j_aid = safe_str(j.aid, "0")
+            if j_aid == "" then j_aid = "0" end
+            local alias_val = (j_ps ~= "" and j_ps)
+                or (hash_alias ~= "" and hash_alias)
+                or (j_add .. ":" .. j_port)
             local srv = {
                 alias = alias_val,
-                server = tostring(j.add),
-                server_port = { tostring(j.port) },
-                password = tostring(j.id or ""),
+                server = j_add,
+                server_port = { j_port },
+                password = safe_str(j.id),
                 protocol = "vmess",
-                vmess_security = tostring(j.scy or "auto"),
-                vmess_alter_id = tostring(j.aid or "0"),
-                alter_id = tostring(j.aid or "0"),
+                vmess_security = safe_str(j.scy, "auto"),
+                vmess_alter_id = j_aid,
+                alter_id = j_aid,
                 vmess_tls = tls_mode,
                 transport = net,
                 domain_strategy = "UseIP",
                 dialer_proxy = "disabled"
             }
+            if srv.vmess_security == "" then srv.vmess_security = "auto" end
             if net == "tcp" then
-                srv.tcp_guise = (j.type == "http") and "http" or "none"
-                if j.host and j.host ~= "" then srv.http_host = { tostring(j.host) } end
-                if j.path and j.path ~= "" then srv.http_path = { tostring(j.path) } end
+                srv.tcp_guise = (safe_str(j.type) == "http") and "http" or "none"
+                if j_host ~= "" then srv.http_host = { j_host } end
+                if j_path ~= "" then srv.http_path = { j_path } end
             elseif net == "ws" then
-                srv.ws_host = tostring(j.host or "")
-                srv.ws_path = tostring(j.path or "/")
+                srv.ws_host = j_host
+                srv.ws_path = j_path ~= "" and j_path or "/"
             elseif net == "grpc" then
-                srv.grpc_service_name = tostring(j.path or "")
+                srv.grpc_service_name = j_path
             elseif net == "splithttp" then
-                srv.splithttp_host = tostring(j.host or "")
-                srv.splithttp_path = tostring(j.path or "/")
+                srv.splithttp_host = j_host
+                srv.splithttp_path = j_path ~= "" and j_path or "/"
             elseif net == "httpupgrade" then
-                srv.httpupgrade_host = tostring(j.host or "")
-                srv.httpupgrade_path = tostring(j.path or "/")
+                srv.httpupgrade_host = j_host
+                srv.httpupgrade_path = j_path ~= "" and j_path or "/"
             end
             if tls_mode == "tls" then
-                srv.vmess_tls_host = tostring(j.sni or j.host or "")
-                srv.vmess_tls_insecure = (j.allowInsecure == true or j.allowInsecure == "1" or j.insecure == "1") and "1" or "0"
-                srv.vmess_tls_fingerprint = tostring(j.fp or "chrome")
+                srv.vmess_tls_host = j_sni ~= "" and j_sni or j_host
+                srv.vmess_tls_insecure = (j.allowInsecure == true or safe_str(j.allowInsecure) == "1" or safe_str(j.insecure) == "1") and "1" or "0"
+                srv.vmess_tls_fingerprint = safe_str(j.fp, "chrome")
+                if srv.vmess_tls_fingerprint == "" then srv.vmess_tls_fingerprint = "chrome" end
             end
             return srv
         end
@@ -800,15 +918,7 @@ local function parse_single_uri(line)
 
     -- 2. ss:// (SIP002 & legacy base64, IPv4 & IPv6 literal)
     if line:match("^ss://") then
-        local rest = line:sub(6)
-        local alias = ""
-        local hash_pos = rest:find("#", 1, true)
-        if hash_pos then
-            alias = url_decode(rest:sub(hash_pos + 1))
-            rest = rest:sub(1, hash_pos - 1)
-        end
-        local q_pos = rest:find("?", 1, true)
-        if q_pos then rest = rest:sub(1, q_pos - 1) end
+        local rest, alias = split_uri_parts(line:sub(6))
 
         local userinfo, hostport = rest:match("^([^@]+)@(.+)$")
         local method, pass, host, port
@@ -851,19 +961,7 @@ local function parse_single_uri(line)
     -- 3. hysteria2:// and hy2://
     local hy_prefix = line:match("^(hysteria2)://") or line:match("^(hy2)://")
     if hy_prefix then
-        local rest = line:sub(#hy_prefix + 4)
-        local alias = ""
-        local hash_pos = rest:find("#", 1, true)
-        if hash_pos then
-            alias = url_decode(rest:sub(hash_pos + 1))
-            rest = rest:sub(1, hash_pos - 1)
-        end
-        local qs = ""
-        local q_pos = rest:find("?", 1, true)
-        if q_pos then
-            qs = rest:sub(q_pos + 1)
-            rest = rest:sub(1, q_pos - 1)
-        end
+        local rest, alias, qs = split_uri_parts(line:sub(#hy_prefix + 4))
         local auth, hostport = rest:match("^([^@]+)@(.+)$")
         if not auth then
             auth = ""
@@ -892,9 +990,7 @@ local function parse_single_uri(line)
             hysteria_tls_host = q.sni or q.peer or "",
             hysteria_tls_insecure = insecure,
             hysteria_tls_fingerprint = q.fp or "chrome",
-            hysteria_up = up_val,
             hysteria_up_mbps = up_val,
-            hysteria_down = down_val,
             hysteria_down_mbps = down_val,
             hysteria_udphop_port = mport,
             domain_strategy = "UseIP",
@@ -905,19 +1001,7 @@ local function parse_single_uri(line)
     -- 4. vless:// and trojan://
     local proto = line:match("^(vless)://") or line:match("^(trojan)://")
     if proto then
-        local rest = line:sub(#proto + 4)
-        local alias = ""
-        local hash_pos = rest:find("#", 1, true)
-        if hash_pos then
-            alias = url_decode(rest:sub(hash_pos + 1))
-            rest = rest:sub(1, hash_pos - 1)
-        end
-        local qs = ""
-        local q_pos = rest:find("?", 1, true)
-        if q_pos then
-            qs = rest:sub(q_pos + 1)
-            rest = rest:sub(1, q_pos - 1)
-        end
+        local rest, alias, qs = split_uri_parts(line:sub(#proto + 4))
         local uuid, hostport = rest:match("^([^@]+)@(.+)$")
         if not uuid or not hostport then return nil end
         local host, port, _, url_path = parse_host_port(hostport)
@@ -954,7 +1038,6 @@ local function parse_single_uri(line)
                 srv.vless_reality_public_key = q.pbk or ""
                 srv.vless_reality_short_id = q.sid or ""
                 srv.vless_reality_spider_x = q.spx or ""
-                srv.vless_spider_x = q.spx or ""
                 srv.vless_reality_fingerprint = q.fp or "chrome"
             end
         elseif proto == "trojan" then
@@ -1210,33 +1293,36 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
     styleEl.id = "gl-xray-full-style";
     styleEl.textContent = [
       ".xgl-wrap { padding: 8px 0 36px; font-size: 14px; line-height: 1.5; }",
-      ".xgl-topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; border-radius: 10px; background: rgba(128,128,128,0.08); margin-bottom: 16px; border: 1px solid rgba(140,140,140,0.18); }",
-      ".xgl-status-group { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }",
+      ".xgl-topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; border-radius: 10px; background: rgba(128,128,128,0.08); margin-bottom: 14px; border: 1px solid rgba(140,140,140,0.18); }",
+      ".xgl-dirty-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 16px; border-radius: 8px; background: rgba(243, 156, 18, 0.14); border: 1px solid rgba(243, 156, 18, 0.4); margin-bottom: 14px; font-size: 13px; }",
+      ".xgl-status-group { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }",
       ".xgl-badge { display: inline-flex; align-items: center; padding: 4px 11px; border-radius: 999px; font-size: 12px; font-weight: 600; }",
       ".xgl-badge.ok { background: rgba(46, 204, 113, 0.16); color: #27ae60; }",
+      ".xgl-badge.warn { background: rgba(243, 156, 18, 0.16); color: #d68910; }",
       ".xgl-badge.err { background: rgba(231, 76, 60, 0.16); color: #e74c3c; }",
       ".xgl-badge.info { background: rgba(52, 152, 219, 0.15); color: #2980b9; }",
       ".xgl-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; border-bottom: 1px solid rgba(140,140,140,0.2); padding-bottom: 8px; }",
-      ".xgl-tab { padding: 8px 15px; border-radius: 6px; cursor: pointer; font-weight: 500; font-size: 13px; transition: all 0.15s; user-select: none; opacity: 0.78; }",
+      ".xgl-tab { padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 500; font-size: 13px; transition: all 0.15s; user-select: none; opacity: 0.78; }",
       ".xgl-tab:hover { opacity: 1; background: rgba(128,128,128,0.1); }",
       ".xgl-tab.active { opacity: 1; background: #2b6cb0; color: #fff; font-weight: 600; }",
-      ".xgl-section-title { font-size: 15px; font-weight: 600; margin: 18px 0 8px; padding-bottom: 6px; border-bottom: 1px solid rgba(140,140,140,0.18); display: flex; align-items: center; justify-content: space-between; }",
+      ".xgl-section-title { font-size: 15px; font-weight: 600; margin: 18px 0 8px; padding-bottom: 6px; border-bottom: 1px solid rgba(140,140,140,0.18); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }",
       ".xgl-section-title:first-child { margin-top: 2px; }",
       ".xgl-row { display: flex; align-items: flex-start; justify-content: space-between; padding: 12px 0; border-bottom: 1px dashed rgba(140,140,140,0.14); gap: 16px; flex-wrap: wrap; }",
       ".xgl-row:last-child { border-bottom: none; }",
       ".xgl-label-col { flex: 1; min-width: 220px; }",
       ".xgl-label { font-weight: 500; font-size: 14px; }",
       ".xgl-desc { font-size: 12px; opacity: 0.68; margin-top: 3px; }",
-      ".xgl-ctrl-col { width: 360px; max-width: 100%; display: flex; flex-direction: column; align-items: flex-end; }",
+      ".xgl-ctrl-col { width: 380px; max-width: 100%; display: flex; flex-direction: column; align-items: flex-end; }",
       ".xgl-input, .xgl-select, .xgl-textarea { width: 100%; box-sizing: border-box; padding: 7px 11px; border-radius: 6px; border: 1px solid rgba(140,140,140,0.35); background: transparent; color: inherit; font-size: 13px; outline: none; }",
       ".xgl-input:focus, .xgl-select:focus, .xgl-textarea:focus { border-color: #2b6cb0; }",
-      ".xgl-select option { background: #222; color: #fff; }",
+      ".xgl-select option { background: var(--card-bg, #ffffff); color: var(--text-color, #222222); }",
       ".xgl-textarea { font-family: inherit; resize: vertical; min-height: 34px; line-height: 1.45; overflow-y: auto; }",
       ".xgl-btn-bar { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-top: 18px; padding-top: 12px; border-top: 1px solid rgba(140,140,140,0.18); }",
-      ".xgl-btn { padding: 7px 15px; border-radius: 6px; border: 1px solid rgba(140,140,140,0.35); background: transparent; color: inherit; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.15s; }",
-      ".xgl-btn:hover { background: rgba(128,128,128,0.12); }",
+      ".xgl-btn { padding: 7px 14px; border-radius: 6px; border: 1px solid rgba(140,140,140,0.35); background: transparent; color: inherit; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.15s; }",
+      ".xgl-btn:hover:not(:disabled) { background: rgba(128,128,128,0.12); }",
+      ".xgl-btn:disabled { opacity: 0.52; cursor: not-allowed; }",
       ".xgl-btn.primary { background: #2b6cb0; color: #fff; border-color: #2b6cb0; }",
-      ".xgl-btn.primary:hover { background: #2c5282; }",
+      ".xgl-btn.primary:hover:not(:disabled) { background: #2c5282; }",
       ".xgl-btn.success { background: #27ae60; color: #fff; border-color: #27ae60; }",
       ".xgl-btn.danger { color: #e74c3c; border-color: rgba(231,76,60,0.45); }",
       ".xgl-btn.sm { padding: 4px 10px; font-size: 12px; }",
@@ -1268,11 +1354,69 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
     return v;
   }
 
-  function callRpc(method, args) {
+  var BLACKLIST_HOOK_TAG = "// __GL_XRAY_PRESET_BLACKLIST__";
+  var BLACKLIST_HOOK_SCRIPT = [
+    BLACKLIST_HOOK_TAG,
+    "return function(config) {",
+    "    let new_rules = [];",
+    "    let fallback_rules = [];",
+    "",
+    "    // 1. 阻断 UDP 443 (QUIC)，对应 v2rayN 阻断udp443",
+    "    push(new_rules, {",
+    "        type: \"field\",",
+    "        port: \"443\",",
+    "        network: \"udp\",",
+    "        outboundTag: \"blackhole_outbound\"",
+    "    });",
+    "",
+    "    // 2. 在兜底规则前追加 v2rayN 黑名单 IP 集，并将最终兜底改为 direct",
+    "    let blacklist_ips = [",
+    "        \"geoip:facebook\", \"geoip:fastly\", \"geoip:google\",",
+    "        \"geoip:netflix\", \"geoip:telegram\", \"geoip:twitter\",",
+    "        \"1.1.1.1\", \"1.0.0.1\", \"1.1.1.2\", \"1.0.0.2\", \"1.1.1.3\", \"1.0.0.3\",",
+    "        \"8.8.8.8\", \"8.8.4.4\", \"94.140.14.14\", \"94.140.15.15\",",
+    "        \"208.67.222.222\", \"208.67.220.220\", \"9.9.9.9\", \"149.112.112.112\",",
+    "        \"77.88.8.8\", \"77.88.8.1\"",
+    "    ];",
+    "    for (let r in config.routing.rules) {",
+    "        if (r.domain == null && r.ip == null && (",
+    "            r.balancerTag == \"tcp_outbound_v4\" ||",
+    "            r.balancerTag == \"udp_outbound_v4\" ||",
+    "            r.balancerTag == \"tcp_outbound_v6\" ||",
+    "            r.balancerTag == \"udp_outbound_v6\"",
+    "        )) {",
+    "            if (r.balancerTag == \"tcp_outbound_v4\" || r.balancerTag == \"udp_outbound_v4\") {",
+    "                push(new_rules, {",
+    "                    type: \"field\",",
+    "                    inboundTag: r.inboundTag,",
+    "                    ip: blacklist_ips,",
+    "                    balancerTag: r.balancerTag",
+    "                });",
+    "            }",
+    "            push(fallback_rules, {",
+    "                type: \"field\",",
+    "                inboundTag: r.inboundTag,",
+    "                outboundTag: \"direct\"",
+    "            });",
+    "        } else {",
+    "            push(new_rules, r);",
+    "        }",
+    "    }",
+    "",
+    "    for (let fb in fallback_rules) {",
+    "        push(new_rules, fb);",
+    "    }",
+    "    config.routing.rules = new_rules;",
+    "    return config;",
+    "};"
+  ].join("\n");
+
+  function callRpc(method, args, timeoutMs) {
     if (typeof window.$rpcRequest !== "function") {
       return Promise.reject(new Error("$rpcRequest 未就绪"));
     }
-    return window.$rpcRequest("call", ["sid", "xray", method, withoutNulls(args || {})]).then(function (res) {
+    var opts = timeoutMs ? { timeout: timeoutMs } : {};
+    return window.$rpcRequest("call", ["sid", "xray", method, withoutNulls(args || {})], opts).then(function (res) {
       if (!res || res.code !== 0) {
         throw new Error((res && res.error) || "RPC 请求失败");
       }
@@ -1311,6 +1455,12 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
     return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
   }
 
+  function getLuciUrl() {
+    var proto = window.location.protocol;
+    var port = proto === "https:" ? "8443" : "8080";
+    return proto + "//" + window.location.hostname + ":" + port + "/cgi-bin/luci/admin/services/xray_core";
+  }
+
   var XrayApp = {
     name: "GlSdk4UiXray",
     data: function () {
@@ -1318,8 +1468,10 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         activeTab: "status",
         loading: true,
         saving: false,
+        savingServer: false,
         testing: false,
         toastMsg: "",
+        savedSnapshot: "",
         running: false,
         proc_running: false,
         tproxy_enabled: false,
@@ -1337,10 +1489,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         servers: [],
         subsections: {
           lan_hosts: [],
-          extra_inbound: [],
-          fakedns: [],
-          manual_tproxy: [],
-          bridge: []
+          extra_inbound: []
         },
         lan_clients: [],
 
@@ -1363,38 +1512,89 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         tproxyIfacesV4Text: "br-lan",
         tproxyIfacesV6Text: "br-lan",
 
-        // Server search, import, and modal editing
+        // Server search, protocol filter, import, and modal editing
         serverKeyword: "",
+        serverProtoFilter: "",
         showImportBox: false,
         importText: "",
         importReplaceAll: false,
         importing: false,
         editingServer: null,
 
-        // New LAN host & Extra inbound forms
+        // Instant-apply subsection forms (Tab 3)
         newLanHost: { macaddr: "", alias: "", access_control_strategy_v4: "bypass", access_control_strategy_v6: "bypass" },
         newInbound: { inbound_addr: "0.0.0.0", inbound_port: "1080", inbound_type: "socks5", specify_outbound: "0", destination: "" },
 
-        // Config JSON preview & logs
+        // Config JSON preview & logs (Tab 5)
         previewJson: "",
         previewLogs: "",
         loadingPreview: false
       };
     },
+    computed: {
+      isDirty: function () {
+        if (!this.savedSnapshot) return false;
+        return this.buildGeneralSnapshot() !== this.savedSnapshot;
+      }
+    },
     created: function () {
       var self = this;
       self.loadAll();
       self.metricsTimer = setInterval(function () {
+        if (typeof document !== "undefined" && document.hidden) return;
+        if (!self.proc_running || self.gen.metrics_server_enable !== "1") return;
         self.refreshMetrics();
       }, 5000);
+      self._onKeyDown = function (e) {
+        if (e.key === "Escape" && self.editingServer) {
+          self.editingServer = null;
+        }
+      };
+      self._onVisChange = function () {
+        if (typeof document !== "undefined" && !document.hidden && self.proc_running && self.gen.metrics_server_enable === "1") {
+          self.refreshMetrics();
+        }
+      };
+      if (typeof document !== "undefined") {
+        document.addEventListener("keydown", self._onKeyDown);
+        document.addEventListener("visibilitychange", self._onVisChange);
+      }
     },
     beforeDestroy: function () {
       if (this.metricsTimer) {
         clearInterval(this.metricsTimer);
         this.metricsTimer = null;
       }
+      if (typeof document !== "undefined") {
+        if (this._onKeyDown) document.removeEventListener("keydown", this._onKeyDown);
+        if (this._onVisChange) document.removeEventListener("visibilitychange", this._onVisChange);
+      }
     },
     methods: {
+      buildGeneralPayload: function () {
+        return Object.assign({}, this.gen, {
+          tcp_balancer_v4: this.tcpNodesV4,
+          udp_balancer_v4: this.udpNodesV4,
+          tcp_balancer_v6: this.tcpNodesV6,
+          udp_balancer_v6: this.udpNodesV6,
+          bypassed_domain_rules: linesToArr(this.bypassedRulesText),
+          forwarded_domain_rules: linesToArr(this.forwardedRulesText),
+          blocked_domain_rules: linesToArr(this.blockedRulesText),
+          geoip_direct_code_list: linesToArr(this.geoipDirectV4Text),
+          geoip_direct_code_list_v6: linesToArr(this.geoipDirectV6Text),
+          wan_bp_ips: linesToArr(this.wanBpIpsText),
+          wan_fw_ips: linesToArr(this.wanFwIpsText),
+          wan_bp_tcp_ports: linesToArr(this.wanBpTcpPortsText),
+          wan_bp_udp_ports: linesToArr(this.wanBpUdpPortsText),
+          wan_fw_tcp_ports: linesToArr(this.wanFwTcpPortsText),
+          wan_fw_udp_ports: linesToArr(this.wanFwUdpPortsText),
+          tproxy_ifaces_v4: linesToArr(this.tproxyIfacesV4Text),
+          tproxy_ifaces_v6: linesToArr(this.tproxyIfacesV6Text)
+        });
+      },
+      buildGeneralSnapshot: function () {
+        return JSON.stringify(this.buildGeneralPayload());
+      },
       refreshMetrics: function () {
         var self = this;
         callRpc("get_metrics", {}).then(function (d) {
@@ -1489,11 +1689,12 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           self.tproxyIfacesV6Text = arrToLines(g.tproxy_ifaces_v6 || ["br-lan"]);
 
           self.servers = Array.isArray(d.servers) ? d.servers : [];
-          self.subsections = d.subsections || { lan_hosts: [], extra_inbound: [], fakedns: [], manual_tproxy: [], bridge: [] };
+          self.subsections = d.subsections || { lan_hosts: [], extra_inbound: [] };
           self.lan_clients = Array.isArray(d.lan_clients) ? d.lan_clients : [];
           if (!self.newInbound.destination && self.servers.length > 0) {
             self.newInbound.destination = self.servers[0][".name"];
           }
+          self.savedSnapshot = self.buildGeneralSnapshot();
         }).catch(function (e) {
           self.showToast("加载失败: " + e.message);
         }).finally(function () {
@@ -1504,27 +1705,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
       saveAllGeneral: function () {
         var self = this;
         self.saving = true;
-        var payload = Object.assign({}, self.gen, {
-          tcp_balancer_v4: self.tcpNodesV4,
-          udp_balancer_v4: self.udpNodesV4,
-          tcp_balancer_v6: self.tcpNodesV6,
-          udp_balancer_v6: self.udpNodesV6,
-          bypassed_domain_rules: linesToArr(self.bypassedRulesText),
-          forwarded_domain_rules: linesToArr(self.forwardedRulesText),
-          blocked_domain_rules: linesToArr(self.blockedRulesText),
-          geoip_direct_code_list: linesToArr(self.geoipDirectV4Text),
-          geoip_direct_code_list_v6: linesToArr(self.geoipDirectV6Text),
-          wan_bp_ips: linesToArr(self.wanBpIpsText),
-          wan_fw_ips: linesToArr(self.wanFwIpsText),
-          wan_bp_tcp_ports: linesToArr(self.wanBpTcpPortsText),
-          wan_bp_udp_ports: linesToArr(self.wanBpUdpPortsText),
-          wan_fw_tcp_ports: linesToArr(self.wanFwTcpPortsText),
-          wan_fw_udp_ports: linesToArr(self.wanFwUdpPortsText),
-          tproxy_ifaces_v4: linesToArr(self.tproxyIfacesV4Text),
-          tproxy_ifaces_v6: linesToArr(self.tproxyIfacesV6Text)
-        });
-
-        return callRpc("save_general", { values: payload, apply: true }).then(function () {
+        var payload = self.buildGeneralPayload();
+        return callRpc("save_general", { values: payload, apply: true }, 35000).then(function () {
           self.showToast("配置已保存并应用生效！");
           return self.loadAll();
         }).catch(function (e) {
@@ -1534,34 +1716,78 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         });
       },
 
+      detectRoutingPreset: function () {
+        var hook = (this.gen && this.gen.custom_configuration_hook) || "";
+        if (hook.indexOf(BLACKLIST_HOOK_TAG) >= 0) return "blacklist";
+        var bp = linesToArr(this.bypassedRulesText);
+        var geo4 = linesToArr(this.geoipDirectV4Text);
+        if (bp.indexOf("geosite:cn") >= 0 || geo4.indexOf("cn") >= 0) return "bypass_cn";
+        if (bp.length === 0 && geo4.length === 0 && !hook.trim()) return "global";
+        return "custom";
+      },
+
       applyRoutingPreset: function (preset) {
+        var curHook = (this.gen && this.gen.custom_configuration_hook) || "";
         if (preset === "bypass_cn") {
-          this.bypassedRulesText = "geosite:cn";
+          this.bypassedRulesText = "geosite:private\ngeosite:cn";
           this.forwardedRulesText = "geosite:geolocation-!cn";
           this.blockedRulesText = "geosite:category-ads";
           this.geoipDirectV4Text = "cn";
           this.geoipDirectV6Text = "cn";
-          this.showToast("已填入【绕过中国大陆】规则，点击下方保存生效");
+          this.$set(this.gen, "default_dns", "1.1.1.1:53");
+          if (curHook.indexOf(BLACKLIST_HOOK_TAG) >= 0) {
+            this.$set(this.gen, "custom_configuration_hook", "");
+          }
+          this.showToast("已填入【绕过中国大陆】规则，点击“保存并应用”生效");
+        } else if (preset === "blacklist") {
+          this.bypassedRulesText = "geosite:private\ngeosite:cn";
+          this.forwardedRulesText = [
+            "geosite:gfw",
+            "geosite:greatfire",
+            "geosite:google",
+            "domain:api.ip.sb",
+            "domain:cloudflare-dns.com",
+            "domain:one.one.one.one",
+            "domain:dns.google",
+            "domain:adguard-dns.com",
+            "domain:opendns.com",
+            "domain:umbrella.com",
+            "domain:quad9.net",
+            "domain:yandex.net"
+          ].join("\n");
+          this.blockedRulesText = "geosite:category-ads";
+          this.geoipDirectV4Text = "";
+          this.geoipDirectV6Text = "";
+          this.$set(this.gen, "fast_dns", "223.5.5.5:53");
+          this.$set(this.gen, "secure_dns", "1.1.1.1:53");
+          this.$set(this.gen, "default_dns", "223.5.5.5:53");
+          this.$set(this.gen, "tproxy_sniffing", "1");
+          this.$set(this.gen, "route_only", "1");
+          this.$set(this.gen, "direct_bittorrent", "1");
+          this.$set(this.gen, "custom_configuration_hook", BLACKLIST_HOOK_SCRIPT);
+          this.showToast("已填入【黑名单模式 (参考 v2rayN)】，点击“保存并应用”生效");
         } else if (preset === "global") {
           this.bypassedRulesText = "";
           this.forwardedRulesText = "geosite:geolocation-!cn";
           this.geoipDirectV4Text = "";
           this.geoipDirectV6Text = "";
-          this.showToast("已填入【全局代理】规则，点击下方保存生效");
+          this.$set(this.gen, "default_dns", "1.1.1.1:53");
+          if (curHook.indexOf(BLACKLIST_HOOK_TAG) >= 0) {
+            this.$set(this.gen, "custom_configuration_hook", "");
+          }
+          this.showToast("已填入【全局代理】规则，点击“保存并应用”生效");
         }
       },
 
       quickUseServer: function (srvId) {
         var self = this;
-        self.tcpNodesV4 = [srvId];
-        self.udpNodesV4 = [srvId];
         self.saving = true;
         callRpc("switch_node", {
           enabled: true,
           tcp_nodes: [srvId],
           udp_nodes: [srvId]
-        }).then(function () {
-          self.showToast("已切换为唯一主节点并完成重启！");
+        }, 35000).then(function () {
+          self.showToast("已切换为主节点并完成重启！");
           return self.loadAll();
         }).catch(function (e) {
           self.showToast("切换失败: " + e.message);
@@ -1681,7 +1907,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         };
       },
 
-      saveEditingServer: function () {
+      saveEditingServer: function (applyNow) {
         var self = this;
         var ed = self.editingServer;
         if (!ed || !ed.server || !ed.port) {
@@ -1691,7 +1917,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         var p = ed.protocol;
         if (p === "hysteria") {
           ed.transport = "hysteria";
-          if (ed.tls_mode === "none") ed.tls_mode = "tls";
+          if (ed.tls_mode !== "tls") ed.tls_mode = "tls";
         }
         var vals = {
           alias: ed.alias || (ed.server + ":" + ed.port),
@@ -1721,7 +1947,6 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
             vals.vless_reality_public_key = ed.reality_public_key;
             vals.vless_reality_short_id = ed.reality_short_id;
             vals.vless_reality_spider_x = ed.reality_spider_x;
-            vals.vless_spider_x = ed.reality_spider_x;
             vals.vless_reality_fingerprint = ed.reality_fingerprint;
           }
         }
@@ -1736,26 +1961,27 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         if (ed.transport === "splithttp") { vals.splithttp_host = ed.splithttp_host; vals.splithttp_path = ed.splithttp_path; }
         if (ed.transport === "httpupgrade") { vals.httpupgrade_host = ed.httpupgrade_host; vals.httpupgrade_path = ed.httpupgrade_path; }
         if (ed.transport === "hysteria" || p === "hysteria") {
-          vals.hysteria_up = ed.hysteria_up;
           vals.hysteria_up_mbps = ed.hysteria_up;
-          vals.hysteria_down = ed.hysteria_down;
           vals.hysteria_down_mbps = ed.hysteria_down;
           vals.hysteria_udphop_port = ed.hysteria_udphop_port;
         }
 
-        callRpc("save_server", { id: ed.id, values: vals, apply: false }).then(function () {
+        self.savingServer = true;
+        callRpc("save_server", { id: ed.id, values: vals, apply: !!applyNow }, applyNow ? 35000 : 12000).then(function () {
           self.editingServer = null;
-          self.showToast("节点已保存");
-          self.loadAll();
+          self.showToast(applyNow ? "节点已保存并应用生效" : "节点已保存");
+          return self.loadAll();
         }).catch(function (e) {
           self.showToast("保存节点失败: " + e.message);
+        }).finally(function () {
+          self.savingServer = false;
         });
       },
 
-      removeServer: function (id) {
+      removeServer: function (id, alias) {
         var self = this;
-        if (!confirm("确定要删除节点 " + id + " 吗？")) return;
-        callRpc("delete_server", { id: id }).then(function (res) {
+        if (!confirm("确定要删除节点 " + (alias || id) + " (" + id + ") 吗？")) return;
+        callRpc("delete_server", { id: id }, 35000).then(function (res) {
           self.showToast(res && res.restarted ? "已删除节点并自动同步重启服务" : "已删除节点");
           self.loadAll();
         }).catch(function (e) {
@@ -1773,7 +1999,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         callRpc("import_links", {
           text: self.importText,
           replace_all: self.importReplaceAll
-        }).then(function (res) {
+        }, 35000).then(function (res) {
           self.showToast("成功导入 " + res.added + " 个节点！");
           self.importText = "";
           self.showImportBox = false;
@@ -1791,16 +2017,19 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           self.showToast("请填写或选择设备 MAC 地址");
           return;
         }
+        self.saving = true;
         callRpc("save_subsection", {
           type: "lan_hosts",
           values: self.newLanHost,
           apply: true
-        }).then(function () {
+        }, 35000).then(function () {
           self.newLanHost = { macaddr: "", alias: "", access_control_strategy_v4: "bypass", access_control_strategy_v6: "bypass" };
           self.showToast("已添加设备分流规则并生效");
-          self.loadAll();
+          return self.loadAll();
         }).catch(function (e) {
           self.showToast("添加失败: " + e.message);
+        }).finally(function () {
+          self.saving = false;
         });
       },
 
@@ -1819,32 +2048,39 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         if (self.newInbound.specify_outbound === "1" && self.newInbound.destination) {
           vals.destination = [self.newInbound.destination];
         }
+        self.saving = true;
         callRpc("save_subsection", {
           type: "extra_inbound",
           values: vals,
           apply: true
-        }).then(function () {
+        }, 35000).then(function () {
           self.showToast("已添加额外入站端口并生效");
-          self.loadAll();
+          return self.loadAll();
         }).catch(function (e) {
           self.showToast("添加失败: " + e.message);
+        }).finally(function () {
+          self.saving = false;
         });
       },
 
-      deleteSubItem: function (id) {
+      deleteSubItem: function (id, label) {
         var self = this;
-        callRpc("delete_subsection", { id: id, apply: true }).then(function () {
+        if (!confirm("确定要删除规则“" + (label || id) + "”并重启生效吗？")) return;
+        self.saving = true;
+        callRpc("delete_subsection", { id: id, apply: true }, 35000).then(function () {
           self.showToast("已删除规则并生效");
-          self.loadAll();
+          return self.loadAll();
         }).catch(function (e) {
           self.showToast("删除失败: " + e.message);
+        }).finally(function () {
+          self.saving = false;
         });
       },
 
       controlService: function (action) {
         var self = this;
         self.saving = true;
-        callRpc("service_ctl", { action: action }).then(function () {
+        callRpc("service_ctl", { action: action }, 35000).then(function () {
           self.showToast("服务操作已完成: " + action);
           return self.loadAll();
         }).catch(function (e) {
@@ -1860,11 +2096,13 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         self.cnPing = null;
         self.googlePing = null;
         Promise.all([
-          callRpc("test_connectivity", { target: "cn" }),
-          callRpc("test_connectivity", { target: "google" })
+          callRpc("test_connectivity", { target: "cn" }, 10000),
+          callRpc("test_connectivity", { target: "google" }, 10000)
         ]).then(function (r) {
           self.cnPing = r[0];
           self.googlePing = r[1];
+        }).catch(function (e) {
+          self.showToast("测速失败: " + e.message);
         }).finally(function () {
           self.testing = false;
         });
@@ -1874,6 +2112,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         var self = this;
         callRpc("update_geodata", {}).then(function () {
           self.showToast("已在后台开始下载最新 GeoIP / GeoSite 规则库，完成后将自动重启 Xray");
+        }).catch(function (e) {
+          self.showToast("触发规则更新失败: " + e.message);
         });
       },
 
@@ -1883,6 +2123,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         callRpc("get_preview", {}).then(function (d) {
           self.previewJson = d.config_json || "";
           self.previewLogs = d.logs || "暂无相关日志";
+        }).catch(function (e) {
+          self.showToast("加载预览失败: " + e.message);
         }).finally(function () {
           self.loadingPreview = false;
         });
@@ -1930,13 +2172,19 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         });
       }
 
-      function selectInput(obj, key, options) {
+      function selectInput(obj, key, options, onChangeExtra) {
+        var cur = obj[key] || "";
         return h("select", {
           class: "xgl-select",
-          domProps: { value: obj[key] || "" },
-          on: { change: function (e) { self.$set(obj, key, e.target.value); } }
+          domProps: { value: cur },
+          on: {
+            change: function (e) {
+              self.$set(obj, key, e.target.value);
+              if (onChangeExtra) onChangeExtra(e.target.value);
+            }
+          }
         }, options.map(function (opt) {
-          return h("option", { domProps: { value: opt[0] } }, opt[1]);
+          return h("option", { domProps: { value: opt[0], selected: opt[0] === cur } }, opt[1]);
         }));
       }
 
@@ -1970,20 +2218,22 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
               on: { click: function () { self[poolKey] = []; } }
             }, "清空")
           ]) : [
-            h("span", { class: "xgl-desc" }, "未添加节点（请在下方节点列表中点击 +IPv4池 / +IPv6池 添加）")
+            h("span", { class: "xgl-desc" }, "未添加节点（请在下方节点列表中点击 ⚡ 设为主用 或 +IPv4池）")
           ]
         );
       }
 
       // Top status bar
       var m = self.metrics;
+      var statusBadgeClass = "err";
       var statusLabel = "○ Xray 已停止";
       if (self.proc_running) {
-        statusLabel = (self.tproxy_enabled ? "● Xray 透明代理运行中" : "● Xray 核心运行中 (TProxy未挂载)") + (m && m.mem_mb ? " (" + m.mem_mb + ")" : "");
+        statusBadgeClass = self.tproxy_enabled ? "ok" : "warn";
+        statusLabel = (self.tproxy_enabled ? "● Xray 透明代理运行中" : "◐ 仅核心运行 (TProxy 未挂载)") + (m && m.mem_mb ? " (" + m.mem_mb + ")" : "");
       }
       var topBar = h("div", { class: "xgl-topbar" }, [
         h("div", { class: "xgl-status-group" }, [
-          h("span", { class: "xgl-badge " + (self.running ? "ok" : "err") }, statusLabel),
+          h("span", { class: "xgl-badge " + statusBadgeClass }, statusLabel),
           m ? h("span", { class: "xgl-badge ok" }, "代理流量: ↓" + fmtBytes(m.proxy_down) + " / ↑" + fmtBytes(m.proxy_up)) : null,
           m ? h("span", { class: "xgl-badge info" }, "直连流量: ↓" + fmtBytes(m.direct_down) + " / ↑" + fmtBytes(m.direct_up)) : null,
           (m && m.direct_delay != null) ? h("span", { class: "xgl-badge " + (m.direct_delay > 0 ? "ok" : "err") },
@@ -1995,21 +2245,34 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           self.googlePing ? h("span", { class: "xgl-badge " + (self.googlePing.ok ? "ok" : "err") }, "Google测速: " + (self.googlePing.ok ? self.googlePing.latency_ms + "ms" : "不通")) : null
         ]),
         h("div", { class: "xgl-status-group" }, [
-          h("button", { class: "xgl-btn sm", on: { click: self.runPingTest } }, self.testing ? "测速中..." : "⚡ 连通性测速"),
-          h("button", { class: "xgl-btn sm", on: { click: function () { self.controlService("restart"); } } }, "🔄 重启服务"),
+          h("button", { class: "xgl-btn sm", attrs: { disabled: self.testing }, on: { click: self.runPingTest } }, self.testing ? "测速中..." : "⚡ 连通性测速"),
+          h("button", { class: "xgl-btn sm", attrs: { disabled: self.saving }, on: { click: function () { self.controlService("restart"); } } }, "🔄 重启服务"),
           h("button", {
             class: "xgl-btn sm " + (self.proc_running ? "danger" : "success"),
+            attrs: { disabled: self.saving },
             on: { click: function () { self.controlService(self.proc_running ? "stop" : "start"); } }
           }, self.proc_running ? "⏹ 停止" : "▶ 启动")
         ])
       ]);
 
-      // Navigation tabs
+      // Unsaved changes reminder banner
+      var dirtyBanner = self.isDirty ? h("div", { class: "xgl-dirty-bar" }, [
+        h("span", "⚠ 检测到未保存的配置或预设修改，需点击保存后才会写入路由器并重启生效。"),
+        h("div", { class: "xgl-status-group" }, [
+          h("button", { class: "xgl-btn sm", attrs: { disabled: self.saving }, on: { click: self.loadAll } }, "放弃修改"),
+          h("button", { class: "xgl-btn sm primary", attrs: { disabled: self.saving }, on: { click: self.saveAllGeneral } }, self.saving ? "保存中..." : "💾 立即保存并应用")
+        ])
+      ]) : null;
+
+      // Navigation tabs (5 single-responsibility tabs)
+      var lanList = self.subsections.lan_hosts || [];
+      var extraInbounds = self.subsections.extra_inbound || [];
       var tabs = [
-        ["status", "1. 基本设置与节点订阅 (" + self.servers.length + ")"],
+        ["status", "1. 控制台与节点 (" + self.servers.length + ")"],
         ["dns", "2. DNS 与分流规则"],
-        ["advanced", "3. 高级参数与监控"],
-        ["preview", "4. 配置预览与日志"]
+        ["access", "3. 设备控制与入站 (" + (lanList.length + extraInbounds.length) + ")"],
+        ["advanced", "4. 高级参数与监控"],
+        ["preview", "5. 配置预览与日志"]
       ];
       var tabBar = h("div", { class: "xgl-tabs" }, tabs.map(function (t) {
         return h("div", {
@@ -2025,19 +2288,42 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
 
       // Filter servers for node list
       var kw = self.serverKeyword.trim().toLowerCase();
+      var protoF = self.serverProtoFilter;
       var filteredServers = self.servers.filter(function (s) {
+        if (protoF && (s.protocol || "") !== protoF) return false;
         if (!kw) return true;
         return ((s.alias || "") + " " + (s.server || "") + " " + (s.protocol || "")).toLowerCase().indexOf(kw) >= 0;
       });
 
-      // Tab 1: General Settings + Routing Mode + Servers & Subscriptions (Merged)
+      var currentPreset = self.detectRoutingPreset();
+      var presetLabelMap = {
+        bypass_cn: "当前模式：绕过中国大陆",
+        blacklist: "当前模式：黑名单模式 (v2rayN)",
+        global: "当前模式：全局代理",
+        custom: "当前模式：自定义规则"
+      };
+
+      // Tab 1: General Settings + Routing Mode + Servers & Subscriptions
       var tabStatus = h("div", [
         h("div", { class: "xgl-section-title" }, [
-          h("span", "核心透明代理开关、多节点负载均衡池与分流模式"),
           h("div", { class: "xgl-status-group" }, [
-            h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("bypass_cn"); } } }, "一键预设：绕过中国大陆"),
-            h("button", { class: "xgl-btn sm", on: { click: function () { self.applyRoutingPreset("global"); } } }, "一键预设：全局代理"),
-            h("button", { class: "xgl-btn sm primary", on: { click: self.saveAllGeneral } }, self.saving ? "正在保存..." : "💾 保存并应用")
+            h("span", "核心透明代理开关、多节点负载均衡池与分流模式"),
+            h("span", { class: "xgl-badge info" }, presetLabelMap[currentPreset] || "自定义")
+          ]),
+          h("div", { class: "xgl-status-group" }, [
+            h("button", {
+              class: "xgl-btn sm " + (currentPreset === "bypass_cn" ? "success" : ""),
+              on: { click: function () { self.applyRoutingPreset("bypass_cn"); } }
+            }, "绕过中国大陆"),
+            h("button", {
+              class: "xgl-btn sm " + (currentPreset === "blacklist" ? "success" : ""),
+              attrs: { title: "参考本地 v2rayN V4-黑名单(Blacklist)：仅 GFW/海外常用服务走代理，其余默认直连并阻断 UDP 443" },
+              on: { click: function () { self.applyRoutingPreset("blacklist"); } }
+            }, "黑名单模式 (v2rayN)"),
+            h("button", {
+              class: "xgl-btn sm " + (currentPreset === "global" ? "success" : ""),
+              on: { click: function () { self.applyRoutingPreset("global"); } }
+            }, "全局代理")
           ])
         ]),
         row("启用透明代理 (Enable Transparent Proxy)", "总开关：启用后自动配置 dnsmasq 与 nftables 将局域网设备流量按规则转入 Xray", flagSwitch(self.gen, "transparent_proxy_enable")),
@@ -2051,19 +2337,33 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           ["roundRobin", "roundRobin (按序轮询分配)"]
         ])),
 
-        // Node management & Subscription section placed right below routing/general settings
-        h("div", { class: "xgl-section-title", style: { marginTop: "28px" } }, [
+        h("div", { class: "xgl-section-title", style: { marginTop: "24px" } }, [
           h("span", "服务器节点管理与订阅 (" + filteredServers.length + " / " + self.servers.length + ")"),
           h("div", { class: "xgl-status-group" }, [
+            h("select", {
+              class: "xgl-select",
+              style: { width: "115px", padding: "4px 8px" },
+              domProps: { value: self.serverProtoFilter },
+              on: { change: function (e) { self.serverProtoFilter = e.target.value; } }
+            }, [
+              ["", "全部协议"],
+              ["vless", "VLESS"],
+              ["vmess", "VMess"],
+              ["shadowsocks", "SS"],
+              ["trojan", "Trojan"],
+              ["hysteria", "Hysteria2"]
+            ].map(function (opt) {
+              return h("option", { domProps: { value: opt[0], selected: opt[0] === self.serverProtoFilter } }, opt[1]);
+            })),
             h("input", {
               class: "xgl-input",
-              style: { width: "180px", padding: "4px 10px" },
-              attrs: { placeholder: "🔍 搜索节点名称/协议..." },
+              style: { width: "170px", padding: "4px 10px" },
+              attrs: { placeholder: "🔍 搜索节点名称/地址..." },
               domProps: { value: self.serverKeyword },
               on: { input: function (e) { self.serverKeyword = e.target.value; } }
             }),
-            h("button", { class: "xgl-btn sm primary", on: { click: function () { self.showImportBox = !self.showImportBox; } } }, "📥 订阅 / 链接批量导入"),
-            h("button", { class: "xgl-btn sm success", on: { click: function () { self.openEditServer(null); } } }, "➕ 手动新增节点")
+            h("button", { class: "xgl-btn sm primary", on: { click: function () { self.showImportBox = !self.showImportBox; } } }, "📥 订阅 / 链接导入"),
+            h("button", { class: "xgl-btn sm success", on: { click: function () { self.openEditServer(null); } } }, "➕ 新增节点")
           ])
         ]),
 
@@ -2086,8 +2386,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
               "导入前清空现有全部节点（覆盖更新订阅时勾选）"
             ]),
             h("div", { class: "xgl-status-group" }, [
-              h("button", { class: "xgl-btn sm", on: { click: function () { self.showImportBox = false; } } }, "取消"),
-              h("button", { class: "xgl-btn sm primary", on: { click: self.submitImportLinks } }, self.importing ? "正在解析导入..." : "立即导入节点")
+              h("button", { class: "xgl-btn sm", attrs: { disabled: self.importing }, on: { click: function () { self.showImportBox = false; } } }, "取消"),
+              h("button", { class: "xgl-btn sm primary", attrs: { disabled: self.importing }, on: { click: self.submitImportLinks } }, self.importing ? "正在解析导入..." : "立即导入节点")
             ])
           ])
         ]) : null,
@@ -2097,16 +2397,17 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
             h("thead", [
               h("tr", [
                 h("th", { style: { width: "26%" } }, "节点别名 (Alias)"),
-                h("th", { style: { width: "68px", whiteSpace: "nowrap" } }, "协议"),
+                h("th", { style: { width: "60px", whiteSpace: "nowrap" } }, "协议"),
                 h("th", { style: { width: "92px", whiteSpace: "nowrap" } }, "传输/安全"),
-                h("th", { style: { width: "28%" } }, "服务器地址 : 端口"),
-                h("th", { style: { width: "270px", textAlign: "right", whiteSpace: "nowrap" } }, "负载池多选 / 操作")
+                h("th", { style: { width: "24%" } }, "服务器地址 : 端口"),
+                h("th", { style: { width: "330px", textAlign: "right", whiteSpace: "nowrap" } }, "快捷切换 / 负载池 / 操作")
               ])
             ]),
             h("tbody", filteredServers.map(function (srv) {
               var id = srv[".name"];
               var inV4 = self.tcpNodesV4.indexOf(id) >= 0 || self.udpNodesV4.indexOf(id) >= 0;
               var inV6 = self.tcpNodesV6.indexOf(id) >= 0 || self.udpNodesV6.indexOf(id) >= 0;
+              var isSoleV4 = self.tcpNodesV4.length === 1 && self.tcpNodesV4[0] === id && self.udpNodesV4.length === 1 && self.udpNodesV4[0] === id;
               var isCurrent = inV4 || inV6;
               var nm = (self.metrics && self.metrics.nodes && self.metrics.nodes[id]) || null;
               var p = srv.protocol || "";
@@ -2123,25 +2424,32 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
                 h("td", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: "12px" }, attrs: { title: (srv.server || "") + ":" + firstItem(srv.server_port) } }, (srv.server || "") + ":" + firstItem(srv.server_port)),
                 h("td", { style: { textAlign: "right", whiteSpace: "nowrap" } }, [
                   h("button", {
+                    class: "xgl-btn sm " + (isSoleV4 ? "primary" : ""),
+                    style: { marginRight: "5px" },
+                    attrs: { disabled: self.saving || isSoleV4, title: "设为唯一 IPv4 主节点并立即重启生效" },
+                    on: { click: function () { self.quickUseServer(id); } }
+                  }, isSoleV4 ? "当前主用" : "⚡ 设为主用"),
+                  h("button", {
                     class: "xgl-btn sm " + (inV4 ? "success" : ""),
-                    style: { marginRight: "6px" },
+                    style: { marginRight: "5px" },
                     attrs: { title: "加入或移出上方 IPv4 TCP/UDP 负载均衡池" },
                     on: { click: function () { self.toggleFamilyPool("tcpNodesV4", "udpNodesV4", id); } }
-                  }, inV4 ? "✓ IPv4池" : "+IPv4池"),
+                  }, inV4 ? "✓ v4池" : "+v4池"),
                   h("button", {
                     class: "xgl-btn sm " + (inV6 ? "primary" : ""),
-                    style: { marginRight: "6px" },
+                    style: { marginRight: "5px" },
                     attrs: { title: "加入或移出上方 IPv6 TCP/UDP 负载均衡池" },
                     on: { click: function () { self.toggleFamilyPool("tcpNodesV6", "udpNodesV6", id); } }
-                  }, inV6 ? "✓ IPv6池" : "+IPv6池"),
+                  }, inV6 ? "✓ v6池" : "+v6池"),
                   h("button", {
                     class: "xgl-btn sm",
-                    style: { marginRight: "6px" },
+                    style: { marginRight: "5px" },
                     on: { click: function () { self.openEditServer(srv); } }
                   }, "编辑"),
                   h("button", {
                     class: "xgl-btn sm danger",
-                    on: { click: function () { self.removeServer(id); } }
+                    attrs: { disabled: self.saving },
+                    on: { click: function () { self.removeServer(id, srv.alias); } }
                   }, "删除")
                 ])
               ]);
@@ -2150,20 +2458,17 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
         ])
       ]);
 
-      // Tab 2: DNS, Outbound Routing, Sniffing, LAN Hosts & Extra Inbounds
-      var lanList = self.subsections.lan_hosts || [];
-      var extraInbounds = self.subsections.extra_inbound || [];
-
+      // Tab 2: DNS, Domain Rules, Outbound IP/Port Routing, Sniffing
       var tabDns = h("div", [
         h("div", { class: "xgl-section-title" }, [
           h("span", "分流 DNS 与去广告域名规则"),
           h("button", { class: "xgl-btn sm", on: { click: self.triggerGeoUpdate } }, "🌐 在线更新 GeoIP / GeoSite 规则库")
         ]),
-        row("国内快速 DNS (Fast DNS)", "用于解析代理服务器入口域名及下方直连白名单域名（推荐 223.5.5.5:53 或 119.29.29.29:53）", textInput(self.gen, "fast_dns", "223.5.5.5:53")),
-        row("直连域名规则 (Bypassed Domain Rules)", "每行一条，匹配域名使用快速 DNS 解析且直接绕过代理直连（如 geosite:cn 或 domain:bilibili.com）", autoTextarea(self, "bypassedRulesText", "例如 geosite:cn（回车可输入多行）")),
-        row("海外安全 DNS (Secure DNS)", "通过代理解析被污染的海外域名（推荐 1.1.1.1:53 或 8.8.8.8:53）", textInput(self.gen, "secure_dns", "1.1.1.1:53")),
-        row("强制代理域名规则 (Forwarded Domain Rules)", "每行一条，匹配域名走安全 DNS 并强制走代理出站（如 geosite:geolocation-!cn 或 domain:openai.com）", autoTextarea(self, "forwardedRulesText", "例如 geosite:geolocation-!cn（回车可输入多行）")),
-        row("默认兜底 DNS (Default DNS)", "未命中上述规则的其他域名使用的 DNS", textInput(self.gen, "default_dns", "1.1.1.1:53")),
+        row("国内快速 DNS (Fast DNS)", "用于解析代理服务器入口域名及下方直连白名单域名（填 IP:端口，推荐 223.5.5.5:53）", textInput(self.gen, "fast_dns", "223.5.5.5:53")),
+        row("直连域名规则 (Bypassed Domain Rules)", "每行一条，匹配域名使用快速 DNS 解析且直接绕过代理直连（如 geosite:cn）", autoTextarea(self, "bypassedRulesText", "例如 geosite:cn（回车可输入多行）")),
+        row("海外安全 DNS (Secure DNS)", "通过代理解析被污染的海外域名（填 IP:端口，推荐 1.1.1.1:53）", textInput(self.gen, "secure_dns", "1.1.1.1:53")),
+        row("强制代理域名规则 (Forwarded Domain Rules)", "每行一条，匹配域名走安全 DNS 并强制走代理出站（如 geosite:gfw 或 geosite:geolocation-!cn）", autoTextarea(self, "forwardedRulesText", "例如 geosite:geolocation-!cn（回车可输入多行）")),
+        row("默认兜底 DNS (Default DNS)", "未命中上述规则的其他域名使用的 DNS（绕过大陆模式建议 1.1.1.1:53，黑名单模式建议 223.5.5.5:53）", textInput(self.gen, "default_dns", "1.1.1.1:53")),
         row("广告与拦截域名规则 (Blocked Domain Rules)", "每行一条，匹配域名直接拦截（如 geosite:category-ads）", autoTextarea(self, "blockedRulesText", "例如 geosite:category-ads（回车可输入多行）")),
         row("拦截域名返回 127.127.127.127 (Blocked to Loopback)", "关闭则返回 NXDOMAIN", flagSwitch(self.gen, "blocked_to_loopback")),
         row("Xray 内部 DNS 监听端口 (DNS Server Port)", "供 dnsmasq 转发上游使用，勿填 53 或 5353", textInput(self.gen, "dns_port", "5300")),
@@ -2174,9 +2479,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           ["per_instance", "per_instance (按实例集成)"]
         ])),
 
-        // Merged Outbound Routing, Sniffing, LAN Hosts & Extra Inbounds
         h("div", { class: "xgl-section-title", style: { marginTop: "24px" } }, "GeoIP 国家代码与 IP/端口出站分流规则"),
-        row("GeoIP 直连代码列表 (IPv4)", "每行一个代码，如 cn（中国大陆 IP 直连）或 telegram；留空则全部非私网 IP 走代理", autoTextarea(self, "geoipDirectV4Text", "如 cn")),
+        row("GeoIP 直连代码列表 (IPv4)", "每行一个代码，如 cn（中国大陆 IP 直连）；黑名单或全局模式请留空", autoTextarea(self, "geoipDirectV4Text", "如 cn")),
         row("GeoIP 直连代码列表 (IPv6)", "每行一个代码，如 cn", autoTextarea(self, "geoipDirectV6Text", "如 cn")),
         row("绕过代理的目标 IP / CIDR (Bypassed IP)", "每行一个 IP 或网段，访问这些目标 IP 时强制直连不经过 Xray", autoTextarea(self, "wanBpIpsText", "每行一个 IP 或 CIDR")),
         row("强制代理的目标 IP / CIDR (Forwarded IP)", "每行一个 IP 或网段，访问这些目标 IP 时始终交由 Xray 处理", autoTextarea(self, "wanFwIpsText", "每行一个 IP 或 CIDR")),
@@ -2191,7 +2495,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           ? row("绕过代理的 UDP 端口 (Bypassed UDP Ports)", "每行一个端口或范围", textInput(self, "wanBpUdpPortsText", "如 123"))
           : row("需要代理的 UDP 端口 (Forwarded UDP Ports)", "推荐 53, 443", textInput(self, "wanFwUdpPortsText", "53, 443")),
 
-        h("div", { class: "xgl-section-title" }, "流量域名嗅探 (Traffic Sniffing)"),
+        h("div", { class: "xgl-section-title", style: { marginTop: "24px" } }, "流量域名嗅探 (Traffic Sniffing)"),
         row("启用流量嗅探 (Enable Sniffing)", "从 TLS SNI / HTTP Host 中还原真实访问域名用于精准路由分流（强烈建议开启）", flagSwitch(self.gen, "tproxy_sniffing")),
         row("仅用于路由分流 (Route Only)", "开启后嗅探出的域名仅用于匹配分流规则，连接时仍使用已解析的 IP，避免二次 DNS 解析开销", flagSwitch(self.gen, "route_only")),
         row("BT 下载流量强制直连 (Bittorrent Direct)", "开启后识别到 BitTorrent 协议流量直接走本地宽带直连，防止触发机场审计封号", flagSwitch(self.gen, "direct_bittorrent")),
@@ -2199,14 +2503,21 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           ["AsIs", "AsIs (仅按域名匹配，最快)"],
           ["IPIfNonMatch", "IPIfNonMatch (域名未命中时解析 IP 匹配)"],
           ["IPOnDemand", "IPOnDemand (遇到 IP 规则时按需解析)"]
-        ])),
+        ]))
+      ]);
 
-        h("div", { class: "xgl-section-title", style: { marginTop: "24px" } }, "局域网设备独立分流控制 (LAN Hosts Access Control)"),
+      // Tab 3: Instant-apply LAN Hosts & Extra Inbounds
+      var tabAccess = h("div", [
+        h("div", { class: "xgl-section-title" }, [
+          h("span", "局域网设备独立分流控制 (LAN Hosts Access Control)"),
+          h("span", { class: "xgl-badge info" }, "添加/删除即时生效")
+        ]),
         h("div", { class: "xgl-desc", style: { marginBottom: "10px" } }, "可针对家里特定设备（如智能电视、游戏机、NAS 或工作电脑）单独指定“完全直连不走代理 (bypass)”或“启用透明代理 (tproxy)”："),
         h("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center", marginBottom: "12px" } }, [
           h("select", {
             class: "xgl-select",
             style: { width: "220px" },
+            domProps: { value: self.newLanHost.macaddr },
             on: {
               change: function (e) {
                 var mac = e.target.value;
@@ -2217,9 +2528,9 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
               }
             }
           }, [
-            h("option", { domProps: { value: "" } }, "-- 从当前在线设备中选择 --")
+            h("option", { domProps: { value: "", selected: !self.newLanHost.macaddr } }, "-- 从当前在线设备中选择 --")
           ].concat(self.lan_clients.map(function (c) {
-            return h("option", { domProps: { value: c.mac } }, c.name + " (" + c.ip + " / " + c.mac + ")");
+            return h("option", { domProps: { value: c.mac, selected: c.mac === self.newLanHost.macaddr } }, c.name + " (" + c.ip + " / " + c.mac + ")");
           }))),
           h("input", {
             class: "xgl-input",
@@ -2246,10 +2557,10 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
               }
             }
           }, [
-            h("option", { domProps: { value: "bypass" } }, "强制直连 (不走代理)"),
-            h("option", { domProps: { value: "tproxy" } }, "启用透明代理")
+            h("option", { domProps: { value: "bypass", selected: self.newLanHost.access_control_strategy_v4 === "bypass" } }, "强制直连 (不走代理)"),
+            h("option", { domProps: { value: "tproxy", selected: self.newLanHost.access_control_strategy_v4 === "tproxy" } }, "启用透明代理")
           ]),
-          h("button", { class: "xgl-btn sm primary", on: { click: self.addLanHostRule } }, "➕ 添加设备规则")
+          h("button", { class: "xgl-btn sm primary", attrs: { disabled: self.saving }, on: { click: self.addLanHostRule } }, "➕ 添加设备规则")
         ]),
         lanList.length > 0 ? h("table", { class: "xgl-table" }, [
           h("thead", [h("tr", [h("th", "设备备注"), h("th", "MAC 地址"), h("th", "IPv4 策略"), h("th", "IPv6 策略"), h("th", "操作")])]),
@@ -2260,13 +2571,20 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
               h("td", item.access_control_strategy_v4 === "bypass" ? "直连 (Bypass)" : "透明代理 (TProxy)"),
               h("td", item.access_control_strategy_v6 === "bypass" ? "直连 (Bypass)" : "透明代理 (TProxy)"),
               h("td", [
-                h("button", { class: "xgl-btn sm danger", on: { click: function () { self.deleteSubItem(item[".name"]); } } }, "删除")
+                h("button", {
+                  class: "xgl-btn sm danger",
+                  attrs: { disabled: self.saving },
+                  on: { click: function () { self.deleteSubItem(item[".name"], item.alias || item.macaddr); } }
+                }, "删除")
               ])
             ]);
           }))
         ]) : h("div", { class: "xgl-desc" }, "当前暂无单独指定的局域网设备规则（所有连接 br-lan 的设备默认共享全局透明代理设置）。"),
 
-        h("div", { class: "xgl-section-title", style: { marginTop: "24px" } }, "额外 SOCKS5 / HTTP 入站端口 (Extra Inbounds)"),
+        h("div", { class: "xgl-section-title", style: { marginTop: "28px" } }, [
+          h("span", "额外 SOCKS5 / HTTP 入站端口 (Extra Inbounds)"),
+          h("span", { class: "xgl-badge info" }, "添加/删除即时生效")
+        ]),
         h("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center", marginBottom: "12px" } }, [
           h("input", {
             class: "xgl-input",
@@ -2288,8 +2606,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
             domProps: { value: self.newInbound.inbound_type },
             on: { change: function (e) { self.newInbound.inbound_type = e.target.value; } }
           }, [
-            h("option", { domProps: { value: "socks5" } }, "SOCKS5 代理"),
-            h("option", { domProps: { value: "http" } }, "HTTP 代理")
+            h("option", { domProps: { value: "socks5", selected: self.newInbound.inbound_type === "socks5" } }, "SOCKS5 代理"),
+            h("option", { domProps: { value: "http", selected: self.newInbound.inbound_type === "http" } }, "HTTP 代理")
           ]),
           h("select", {
             class: "xgl-select",
@@ -2297,8 +2615,8 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
             domProps: { value: self.newInbound.specify_outbound },
             on: { change: function (e) { self.newInbound.specify_outbound = e.target.value; } }
           }, [
-            h("option", { domProps: { value: "0" } }, "出站：跟随全局分流"),
-            h("option", { domProps: { value: "1" } }, "出站：绑定指定节点")
+            h("option", { domProps: { value: "0", selected: self.newInbound.specify_outbound === "0" } }, "出站：跟随全局分流"),
+            h("option", { domProps: { value: "1", selected: self.newInbound.specify_outbound === "1" } }, "出站：绑定指定节点")
           ]),
           self.newInbound.specify_outbound === "1" ? h("select", {
             class: "xgl-select",
@@ -2306,27 +2624,32 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
             domProps: { value: self.newInbound.destination },
             on: { change: function (e) { self.newInbound.destination = e.target.value; } }
           }, self.servers.map(function (s) {
-            return h("option", { domProps: { value: s[".name"] } }, (s.alias || s.server) + " (" + s[".name"] + ")");
+            return h("option", { domProps: { value: s[".name"], selected: s[".name"] === self.newInbound.destination } }, (s.alias || s.server) + " (" + s[".name"] + ")");
           })) : null,
-          h("button", { class: "xgl-btn sm primary", on: { click: self.addExtraInbound } }, "➕ 添加入站端口")
+          h("button", { class: "xgl-btn sm primary", attrs: { disabled: self.saving }, on: { click: self.addExtraInbound } }, "➕ 添加入站端口")
         ]),
         extraInbounds.length > 0 ? h("table", { class: "xgl-table" }, [
           h("thead", [h("tr", [h("th", "监听地址:端口"), h("th", "协议类型"), h("th", "出站设置"), h("th", "操作")])]),
           h("tbody", extraInbounds.map(function (ib) {
             var destId = firstItem(ib.destination);
+            var label = (ib.inbound_addr || "0.0.0.0") + ":" + (ib.inbound_port || "");
             return h("tr", { key: ib[".name"] }, [
-              h("td", (ib.inbound_addr || "0.0.0.0") + ":" + (ib.inbound_port || "")),
+              h("td", label),
               h("td", (ib.inbound_type || "").toUpperCase()),
               h("td", ib.specify_outbound === "1" ? ("绑定节点: " + serverAliasById(destId)) : "跟随全局分流"),
               h("td", [
-                h("button", { class: "xgl-btn sm danger", on: { click: function () { self.deleteSubItem(ib[".name"]); } } }, "删除")
+                h("button", {
+                  class: "xgl-btn sm danger",
+                  attrs: { disabled: self.saving },
+                  on: { click: function () { self.deleteSubItem(ib[".name"], label); } }
+                }, "删除")
               ])
             ]);
           }))
-        ]) : null
+        ]) : h("div", { class: "xgl-desc" }, "当前暂无额外入站端口。")
       ]);
 
-      // Tab 3: Extra Options & Firewall
+      // Tab 4: Extra Options & Firewall
       var tabAdvanced = h("div", [
         h("div", { class: "xgl-section-title" }, "Xray 运行程序与监控统计 (Extra Options)"),
         row("Xray 可执行文件路径 (Xray Bin)", "默认 /usr/bin/xray", textInput(self.gen, "xray_bin", "/usr/bin/xray")),
@@ -2356,19 +2679,20 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           textInput(self.gen, "uplink_only", "2"),
           textInput(self.gen, "downlink_only", "5")
         ])),
-        row("每连接内部缓存大小 (Buffer Size KB)", "默认 4 KB（填 0 禁用内部缓存）", textInput(self.gen, "buffer_size", "4")),
-        row("启用 IPv4 TCP 动态直连优化 (Dynamic Direct)", "大连接数下载场景可提升直连性能", flagSwitch(self.gen, "dynamic_direct_tcp4")),
-        row("自定义 ucode 配置钩子 (Custom Configuration Hook)", "高级用户在生成 config.json 前动态修改配置对象的 ucode 函数", autoTextarea(self.gen, "custom_configuration_hook", "return function(config) { return config; };"))
+        row("每连接内部缓存大小 (Buffer Size KB)", "留空默认 4 KB（填 0 禁用内部缓存；GL-MT3000 勿设过大防 OOM）", textInput(self.gen, "buffer_size", "4")),
+        row("启用 IPv4 TCP 动态直连优化 (Dynamic Direct TCP)", "大连接数下载场景可提升直连性能", flagSwitch(self.gen, "dynamic_direct_tcp4")),
+        row("启用 IPv4 UDP 动态直连优化 (Dynamic Direct UDP)", "UDP 并发场景可提升直连性能", flagSwitch(self.gen, "dynamic_direct_udp4")),
+        row("自定义 ucode 配置钩子 (Custom Configuration Hook)", "高级用户在生成 config.json 前动态修改配置对象的 ucode 函数（黑名单模式预设会自动注入此处）", autoTextarea(self.gen, "custom_configuration_hook", "return function(config) { return config; };"))
       ]);
 
-      // Tab 4: Config Preview & Logs
-      var luciHref = "http://" + window.location.hostname + ":8080/cgi-bin/luci/admin/services/xray_core";
+      // Tab 5: Config Preview & Logs
+      var luciHref = getLuciUrl();
       var tabPreview = h("div", [
         h("div", { class: "xgl-section-title" }, [
           h("span", "Xray 实时系统日志 (logread -e xray)"),
           h("div", { class: "xgl-status-group" }, [
-            h("button", { class: "xgl-btn sm", on: { click: self.loadPreviewData } }, self.loadingPreview ? "刷新中..." : "🔄 刷新配置与日志"),
-            h("a", { class: "xgl-btn sm", attrs: { href: luciHref, target: "_blank" }, style: { textDecoration: "none" } }, "🔗 新窗口打开 8080 原版 LuCI")
+            h("button", { class: "xgl-btn sm", attrs: { disabled: self.loadingPreview }, on: { click: self.loadPreviewData } }, self.loadingPreview ? "刷新中..." : "🔄 刷新配置与日志"),
+            h("a", { class: "xgl-btn sm", attrs: { href: luciHref, target: "_blank", rel: "noopener" }, style: { textDecoration: "none" } }, "🔗 新窗口打开原版 LuCI")
           ])
         ]),
         h("pre", { class: "xgl-code", style: { height: "220px", marginBottom: "18px" } }, self.previewLogs || "点击右上方刷新按钮加载日志..."),
@@ -2383,11 +2707,18 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
           return [s[".name"], (s.alias || s.server) + " (" + s[".name"] + ")"];
         })
       );
-      var editModal = ed ? h("div", { class: "xgl-modal-mask" }, [
+      var editModal = ed ? h("div", {
+        class: "xgl-modal-mask",
+        on: {
+          click: function (e) {
+            if (e.target === e.currentTarget && !self.savingServer) self.editingServer = null;
+          }
+        }
+      }, [
         h("div", { class: "xgl-modal" }, [
           h("div", { class: "xgl-modal-header" }, [
             h("span", ed.id ? "编辑节点 (" + ed.id + ")" : "新增 Xray 节点"),
-            h("button", { class: "xgl-btn sm", on: { click: function () { self.editingServer = null; } } }, "✕")
+            h("button", { class: "xgl-btn sm", attrs: { disabled: self.savingServer }, on: { click: function () { self.editingServer = null; } } }, "✕")
           ]),
           h("div", { class: "xgl-modal-body" }, [
             row("节点别名 (Alias)", "显示在列表与状态栏中的中文名称", textInput(ed, "alias", "例如：日本Z03 | IEPL")),
@@ -2401,7 +2732,14 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
               ["hysteria", "Hysteria2"],
               ["socks", "SOCKS5"],
               ["http", "HTTP"]
-            ])),
+            ], function (val) {
+              if (val === "hysteria") {
+                self.$set(ed, "transport", "hysteria");
+                self.$set(ed, "tls_mode", "tls");
+              } else if (ed.transport === "hysteria") {
+                self.$set(ed, "transport", "tcp");
+              }
+            })),
             row("密码 / UUID (Password / UserId)", "VMess/VLESS 填 UUID；SS/Trojan/Hysteria2 填密码", textInput(ed, "password", "UUID 或密码")),
 
             ed.protocol === "shadowsocks" ? row("Shadowsocks 加密算法", "支持传统 AEAD 与最新 2022-blake3 系列", selectInput(ed, "shadowsocks_security", [
@@ -2456,7 +2794,7 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
               row("Hysteria2 端口跳跃范围 (UDP Hop Port)", "例如 20000-50000（留空则不启用端口跳跃）", textInput(ed, "hysteria_udphop_port", "20000-50000"))
             ]) : null,
 
-            row("传输层加密 (Stream Security)", "VLESS 支持 REALITY 与 TLS；专线节点一般为 none", selectInput(ed, "tls_mode", [
+            row("传输层加密 (Stream Security)", "VLESS 支持 REALITY 与 TLS；Hysteria2 强制 TLS", selectInput(ed, "tls_mode", [
               ["none", "none (不启用 TLS)"],
               ["tls", "tls (标准 TLS)"],
               ["reality", "reality (VLESS REALITY)"]
@@ -2495,27 +2833,33 @@ cat << 'EOF_VIEW_JS' > "$VIEW_JS"
             ]))
           ]),
           h("div", { class: "xgl-modal-footer" }, [
-            h("button", { class: "xgl-btn", on: { click: function () { self.editingServer = null; } } }, "取消"),
-            h("button", { class: "xgl-btn primary", on: { click: self.saveEditingServer } }, "保存节点")
+            h("button", { class: "xgl-btn", attrs: { disabled: self.savingServer }, on: { click: function () { self.editingServer = null; } } }, "取消"),
+            h("button", { class: "xgl-btn", attrs: { disabled: self.savingServer }, on: { click: function () { self.saveEditingServer(false); } } }, "仅保存节点"),
+            h("button", { class: "xgl-btn primary", attrs: { disabled: self.savingServer }, on: { click: function () { self.saveEditingServer(true); } } }, self.savingServer ? "应用中..." : "保存并立即应用")
           ])
         ])
       ]) : null;
 
       var activeView = tabStatus;
       if (self.activeTab === "dns") activeView = tabDns;
+      else if (self.activeTab === "access") activeView = tabAccess;
       else if (self.activeTab === "advanced") activeView = tabAdvanced;
       else if (self.activeTab === "preview") activeView = tabPreview;
+
+      var showGeneralFooter = self.activeTab === "status" || self.activeTab === "dns" || self.activeTab === "advanced";
 
       return h("div", { class: "xgl-wrap" }, [
         h("gl-title", { props: { title: "Xray 透明代理控制台" } }),
         h("gl-card", [
           topBar,
+          dirtyBanner,
           tabBar,
           activeView,
-          self.activeTab !== "preview" ? h("div", { class: "xgl-btn-bar" }, [
-            h("button", { class: "xgl-btn", on: { click: self.loadAll } }, "重新加载配置"),
+          showGeneralFooter ? h("div", { class: "xgl-btn-bar" }, [
+            h("button", { class: "xgl-btn", attrs: { disabled: self.saving }, on: { click: self.loadAll } }, "重新加载配置"),
             h("button", {
               class: "xgl-btn primary",
+              attrs: { disabled: self.saving },
               on: { click: self.saveAllGeneral }
             }, self.saving ? "正在保存并重启 Xray..." : "💾 保存配置并应用生效")
           ]) : null
